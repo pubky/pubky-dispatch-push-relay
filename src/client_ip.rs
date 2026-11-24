@@ -74,8 +74,10 @@ impl TrustedProxies {
     /// Derives the effective client IP for rate limiting.
     ///
     /// If `peer_ip` is NOT in [`TrustedProxies`], forwarded headers are ignored completely
-    /// and `peer_ip` is returned. If `peer_ip` IS trusted, `header_name` entries are walked
-    /// right-to-left skipping trusted proxies, returning the rightmost untrusted address.
+    /// and `peer_ip` is returned. If `peer_ip` IS trusted, `header_name` entries are parsed
+    /// strictly right-to-left skipping trusted proxies and returning the rightmost valid
+    /// untrusted address. Any malformed attacker-supplied entries to its left are ignored;
+    /// a malformed entry encountered before finding an untrusted IP falls back to `peer_ip`.
     #[must_use]
     pub fn extract_client_ip(
         &self,
@@ -91,12 +93,12 @@ impl TrustedProxies {
             return peer_ip;
         };
 
-        let mut hops = Vec::new();
-        for value in headers.get_all(&name) {
+        let header_values: Vec<_> = headers.get_all(&name).iter().collect();
+        for value in header_values.into_iter().rev() {
             let Ok(text) = value.to_str() else {
                 return peer_ip;
             };
-            for part in text.split(',') {
+            for part in text.rsplit(',') {
                 let trimmed = part.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -104,13 +106,10 @@ impl TrustedProxies {
                 let Ok(ip) = IpAddr::from_str(trimmed) else {
                     return peer_ip;
                 };
-                hops.push(canonicalize_ip(ip));
-            }
-        }
-
-        for ip in hops.into_iter().rev() {
-            if !self.is_trusted(ip) {
-                return ip;
+                let canonical = canonicalize_ip(ip);
+                if !self.is_trusted(canonical) {
+                    return canonical;
+                }
             }
         }
 
@@ -189,6 +188,46 @@ mod tests {
         assert_eq!(
             proxies.extract_client_ip(peer, &headers, DEFAULT_TRUSTED_PROXY_HEADER),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+    }
+
+    #[test]
+    fn right_to_left_ignores_malformed_left_entries_but_rejects_malformed_right_hops() {
+        let proxies = TrustedProxies::parse_csv("10.0.0.0/8").unwrap();
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        // Attacker sent malformed garbage on the left; trusted proxies appended real client & hop.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("garbage, 203.0.113.5, 10.0.0.1"),
+        );
+        assert_eq!(
+            proxies.extract_client_ip(peer, &headers, DEFAULT_TRUSTED_PROXY_HEADER),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+
+        // Multiple XFF headers: garbage in an earlier header does not poison rightmost valid hop.
+        let mut multi = HeaderMap::new();
+        multi.append("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        multi.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.9, 10.0.0.1"),
+        );
+        assert_eq!(
+            proxies.extract_client_ip(peer, &multi, DEFAULT_TRUSTED_PROXY_HEADER),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))
+        );
+
+        // Malformed entry to the right of an attacker IP stops traversal and falls back to peer.
+        let mut poisoned = HeaderMap::new();
+        poisoned.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4, garbage, 10.0.0.1"),
+        );
+        assert_eq!(
+            proxies.extract_client_ip(peer, &poisoned, DEFAULT_TRUSTED_PROXY_HEADER),
+            peer
         );
     }
 

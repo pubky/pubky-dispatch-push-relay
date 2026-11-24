@@ -378,12 +378,24 @@ async fn apns_defaults_to_visible_alert_caches_jwt_and_classifies_every_response
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
 
-    // 6. Token-specific APNs 410 Unregistered prunes the handle.
+    // 6. Stale APNs 410 Unregistered timestamp (older than last_active_at_ms) MUST preserve
+    //    the handle and return 502; a timestamp >= last_active_at_ms prunes it.
     prod_responses.lock().push_back((
         StatusCode::GONE,
-        json!({"reason": "Unregistered"}).to_string(),
+        json!({"reason": "Unregistered", "timestamp": later_ms - 5_000}).to_string(),
     ));
-    let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [41; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [41; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert!(
+        store.get(&prod_handle).await.unwrap().is_some(),
+        "stale APNs 410 timestamp must not delete active handle"
+    );
+
+    prod_responses.lock().push_back((
+        StatusCode::GONE,
+        json!({"reason": "Unregistered", "timestamp": later_ms + 1_000}).to_string(),
+    ));
+    let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [45; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], false);
     assert_eq!(body["pruned"], true);
@@ -435,6 +447,7 @@ async fn apns_defaults_to_visible_alert_caches_jwt_and_classifies_every_response
 struct MockFcmState {
     token_requests: Arc<Mutex<Vec<String>>>,
     token_counter: Arc<AtomicUsize>,
+    token_responses: Arc<Mutex<VecDeque<(StatusCode, Value)>>>,
     fcm_requests: Arc<Mutex<Vec<(String, String, Value)>>>,
     fcm_responses: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
 }
@@ -445,6 +458,9 @@ async fn mock_oauth_handler(
 ) -> (StatusCode, Json<Value>) {
     let form = String::from_utf8(body.to_vec()).unwrap();
     state.token_requests.lock().push(form);
+    if let Some((status, payload)) = state.token_responses.lock().pop_front() {
+        return (status, Json(payload));
+    }
     let n = state.token_counter.fetch_add(1, Ordering::SeqCst) + 1;
     (
         StatusCode::OK,
@@ -516,6 +532,7 @@ async fn fcm_signs_with_ring_caches_token_coalesces_bursts_and_classifies_every_
     let mock_state = MockFcmState {
         token_requests: Arc::new(Mutex::new(Vec::new())),
         token_counter: Arc::new(AtomicUsize::new(0)),
+        token_responses: Arc::new(Mutex::new(VecDeque::new())),
         fcm_requests: Arc::new(Mutex::new(Vec::new())),
         fcm_responses: Arc::new(Mutex::new(VecDeque::new())),
     };
@@ -608,7 +625,8 @@ async fn fcm_signs_with_ring_caches_token_coalesces_bursts_and_classifies_every_
         assert!(fcm_reqs[0].2["message"].get("notification").is_none());
     }
 
-    // 2. Non-pruning FCM answer classes (including generic 404!) MUST keep the handle and answer 502.
+    // 2. Non-pruning FCM answer classes (including generic 404 and untyped UNREGISTERED!)
+    //    MUST keep the handle and answer 502.
     let non_pruning_cases = [
         (
             StatusCode::NOT_FOUND,
@@ -617,6 +635,31 @@ async fn fcm_signs_with_ring_caches_token_coalesces_bursts_and_classifies_every_
                     "code": 404,
                     "message": "Project not found.",
                     "status": "NOT_FOUND"
+                }
+            })
+            .to_string(),
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            json!({
+                "error": {
+                    "code": 404,
+                    "status": "NOT_FOUND",
+                    "details": [{ "errorCode": "UNREGISTERED" }]
+                }
+            })
+            .to_string(),
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            json!({
+                "error": {
+                    "code": 404,
+                    "status": "NOT_FOUND",
+                    "details": [{
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "errorCode": "UNREGISTERED"
+                    }]
                 }
             })
             .to_string(),
@@ -892,8 +935,10 @@ async fn apns_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_re
 
     let push_key = SigningKey::from_bytes(&[88u8; 32]);
     let handle = register_via_http(&app, "apns", &"dd".repeat(32), &push_key, None).await;
+    let handle2 = register_via_http(&app, "apns", &"df".repeat(32), &push_key, None).await;
 
-    // 1. 429 with Retry-After: 30 triggers 30s backoff.
+    // 1. Device-scoped 429 TooManyRequests (even with Retry-After: 30) MUST NOT trigger
+    //    provider-wide backoff: an unrelated handle must succeed immediately.
     mock_a.responses.lock().push_back((
         StatusCode::TOO_MANY_REQUESTS,
         Some("30".to_owned()),
@@ -903,15 +948,41 @@ async fn apns_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_re
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     assert_eq!(mock_a.hits.load(Ordering::SeqCst), 1);
 
-    // 5 seconds later: still inside backoff -> short-circuits locally without calling APNs!
-    let t_plus_5 = NOW_MS + 5_000;
-    clock.set(t_plus_5);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_5, [2; 16]).await;
+    let t_plus_2 = NOW_MS + 2_000;
+    clock.set(t_plus_2);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle2, t_plus_2, [2; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        mock_a.hits.load(Ordering::SeqCst),
+        2,
+        "APNs 429 TooManyRequests must not pause unrelated handles"
+    );
+    assert_eq!(
+        state
+            .metrics()
+            .webhook_count(WebhookOutcome::ProviderBackoff),
+        0
+    );
+
+    // 2. Server-wide 503 ServiceUnavailable with delta-seconds Retry-After: 30 triggers backoff.
+    mock_a.responses.lock().push_back((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("30".to_owned()),
+        json!({"reason": "ServiceUnavailable"}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_2, [3; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
+
+    // 5 seconds later: still inside server-wide backoff -> short-circuits locally!
+    let t_plus_7 = t_plus_2 + 5_000;
+    clock.set(t_plus_7);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle2, t_plus_7, [4; 16]).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     assert_eq!(
         mock_a.hits.load(Ordering::SeqCst),
-        1,
-        "provider must not be called while Retry-After backoff is active"
+        3,
+        "provider must not be called while server-wide 503 Retry-After backoff is active"
     );
     assert_eq!(
         state
@@ -920,36 +991,36 @@ async fn apns_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_re
         1
     );
 
-    // 30 seconds after 429: backoff expired -> resumes calling APNs and succeeds!
-    let t_plus_30 = NOW_MS + 30_000;
-    clock.set(t_plus_30);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_30, [3; 16]).await;
+    // 30 seconds after 503: backoff expired -> resumes calling APNs and succeeds!
+    let t_plus_32 = t_plus_2 + 30_000;
+    clock.set(t_plus_32);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_32, [5; 16]).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 4);
 
-    // 2. 503 with HTTP-date Retry-After (+45s = 2026-01-01 00:07:15 GMT).
+    // 3. 503 with HTTP-date Retry-After (+43s = 2026-01-01 00:07:15 GMT).
     mock_a.responses.lock().push_back((
         StatusCode::SERVICE_UNAVAILABLE,
         Some("Thu, 01 Jan 2026 00:07:15 GMT".to_owned()),
         json!({"reason": "ServiceUnavailable"}).to_string(),
     ));
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_30, [4; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_32, [6; 16]).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
-    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 5);
 
-    let t_plus_50 = t_plus_30 + 20_000;
-    clock.set(t_plus_50);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_50, [5; 16]).await;
+    let t_plus_52 = t_plus_32 + 20_000;
+    clock.set(t_plus_52);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_52, [7; 16]).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
-    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 5);
 
-    let t_plus_75 = t_plus_30 + 45_000;
+    let t_plus_75 = NOW_MS + 75_000;
     clock.set(t_plus_75);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_75, [6; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_75, [8; 16]).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 4);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 6);
 
-    // 3. Readiness fails on InvalidProviderToken.
+    // 4. Readiness fails on InvalidProviderToken.
     let ready_before = app
         .clone()
         .oneshot(
@@ -968,7 +1039,7 @@ async fn apns_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_re
         None,
         json!({"reason": "InvalidProviderToken"}).to_string(),
     ));
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_75, [7; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_75, [9; 16]).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     let ready_after = app
         .clone()
@@ -1075,11 +1146,12 @@ async fn fcm_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_rea
     let oauth_state = MockFcmState {
         token_requests: Arc::new(Mutex::new(Vec::new())),
         token_counter: token_counter.clone(),
+        token_responses: Arc::new(Mutex::new(VecDeque::new())),
         fcm_requests: Arc::new(Mutex::new(Vec::new())),
         fcm_responses: Arc::new(Mutex::new(VecDeque::new())),
     };
 
-    // --- Part A: Retry-After backoff & readiness ---
+    // --- Part A: Server-wide Retry-After backoff & readiness recovery ---
     let mock_a = BackoffMockState {
         hits: Arc::new(AtomicUsize::new(0)),
         seen_auths: Arc::new(Mutex::new(Vec::new())),
@@ -1122,8 +1194,10 @@ async fn fcm_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_rea
     let app = router(state.clone());
     let push_key = SigningKey::from_bytes(&[89u8; 32]);
     let handle = register_via_http(&app, "fcm", "fcm-backoff-token", &push_key, None).await;
+    let handle2 = register_via_http(&app, "fcm", "fcm-second-token", &push_key, None).await;
 
-    // 429 with Retry-After: 45 -> short-circuits locally until 45s pass.
+    // 1. Device-scoped 429 on /messages:send (even with Retry-After: 45) MUST NOT pause
+    //    unrelated handles on FCM.
     mock_a.responses.lock().push_back((
         StatusCode::TOO_MANY_REQUESTS,
         Some("45".to_owned()),
@@ -1133,11 +1207,37 @@ async fn fcm_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_rea
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     assert_eq!(mock_a.hits.load(Ordering::SeqCst), 1);
 
-    let t_plus_10 = NOW_MS + 10_000;
-    clock.set(t_plus_10);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_10, [2; 16]).await;
+    let t_plus_5 = NOW_MS + 5_000;
+    clock.set(t_plus_5);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle2, t_plus_5, [2; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        mock_a.hits.load(Ordering::SeqCst),
+        2,
+        "FCM /messages:send 429 must not trigger provider-wide backoff"
+    );
+    assert_eq!(
+        state
+            .metrics()
+            .webhook_count(WebhookOutcome::ProviderBackoff),
+        0
+    );
+
+    // 2. Server-wide 503 UNAVAILABLE with Retry-After: 45 triggers provider-wide backoff.
+    mock_a.responses.lock().push_back((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("45".to_owned()),
+        json!({"error": {"code": 503, "status": "UNAVAILABLE"}}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_5, [3; 16]).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
-    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
+
+    let t_plus_15 = t_plus_5 + 10_000;
+    clock.set(t_plus_15);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle2, t_plus_15, [4; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
     assert_eq!(
         state
             .metrics()
@@ -1145,21 +1245,31 @@ async fn fcm_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_rea
         1
     );
 
-    let t_plus_45 = NOW_MS + 45_000;
-    clock.set(t_plus_45);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_45, [3; 16]).await;
+    let t_plus_50 = t_plus_5 + 45_000;
+    clock.set(t_plus_50);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_50, [5; 16]).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 4);
 
-    // Readiness flips to 503 after upstream 403 auth failure.
+    // 3. Per-message 403 SENDER_ID_MISMATCH MUST NOT flip /health/ready to 503.
     mock_a.responses.lock().push_back((
         StatusCode::FORBIDDEN,
         None,
-        json!({"error": {"code": 403, "status": "PERMISSION_DENIED"}}).to_string(),
+        json!({
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                    "errorCode": "SENDER_ID_MISMATCH"
+                }]
+            }
+        })
+        .to_string(),
     ));
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_45, [4; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_50, [6; 16]).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
-    let ready = app
+    let ready_after_403 = app
         .clone()
         .oneshot(
             Request::builder()
@@ -1170,13 +1280,65 @@ async fn fcm_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_rea
         )
         .await
         .unwrap();
-    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        ready_after_403.status(),
+        StatusCode::OK,
+        "per-message SENDER_ID_MISMATCH must not drain pod readiness"
+    );
+
+    // 4. Provider credential failure (double 401 -> OAuth failure) flips /health/ready to 503,
+    //    and once OAuth succeeds again /health/ready recovers to 200 without needing push traffic!
+    mock_a.responses.lock().push_back((
+        StatusCode::UNAUTHORIZED,
+        None,
+        json!({"error": {"code": 401, "status": "UNAUTHENTICATED"}}).to_string(),
+    ));
+    mock_a.responses.lock().push_back((
+        StatusCode::UNAUTHORIZED,
+        None,
+        json!({"error": {"code": 401, "status": "UNAUTHENTICATED"}}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_50, [7; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+
+    // While OAuth still rejects credentials, readiness probe reports 503.
+    oauth_state
+        .token_responses
+        .lock()
+        .push_back((StatusCode::UNAUTHORIZED, json!({"error": "invalid_grant"})));
+    let ready_down = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_down.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Once OAuth succeeds again, /health/ready probes OAuth and recovers cleanly to 200.
+    let ready_recovered = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_recovered.status(), StatusCode::OK);
 
     // --- Part B: Concurrent 401 does NOT wipe freshly refreshed OAuth token ---
     let race_token_counter = Arc::new(AtomicUsize::new(0));
     let race_oauth = MockFcmState {
         token_requests: Arc::new(Mutex::new(Vec::new())),
         token_counter: race_token_counter.clone(),
+        token_responses: Arc::new(Mutex::new(VecDeque::new())),
         fcm_requests: Arc::new(Mutex::new(Vec::new())),
         fcm_responses: Arc::new(Mutex::new(VecDeque::new())),
     };

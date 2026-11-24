@@ -14,7 +14,9 @@ use super::{
     ApnsEnv, BoxFuture, Platform, RegisterOutcome, Registration, RegistrationLimits,
     RegistrationStore, StoreError,
 };
-use crate::replay::{NONCE_TTL_MS, ReplayError, ReplayStore};
+use crate::replay::{
+    DEFAULT_MAX_NONCES_PER_HANDLE, NONCE_TTL_MS, ReplayError, ReplayStore, handle_replay_hash,
+};
 
 struct SqlMigration {
     version: i64,
@@ -22,11 +24,18 @@ struct SqlMigration {
     sql: &'static str,
 }
 
-const SQLITE_MIGRATIONS: &[SqlMigration] = &[SqlMigration {
-    version: 1,
-    description: "initial",
-    sql: include_str!("../../migrations/sqlite/0001_initial.sql"),
-}];
+const SQLITE_MIGRATIONS: &[SqlMigration] = &[
+    SqlMigration {
+        version: 1,
+        description: "initial",
+        sql: include_str!("../../migrations/sqlite/0001_initial.sql"),
+    },
+    SqlMigration {
+        version: 2,
+        description: "replay_handle_hash",
+        sql: include_str!("../../migrations/sqlite/0002_replay_handle_hash.sql"),
+    },
+];
 
 const SCHEMA_MIGRATIONS_TABLE_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -493,10 +502,11 @@ impl RegistrationStore for SqliteStore {
     fn get_active<'a>(
         &'a self,
         handle: &'a str,
-        active_cutoff_ms: u64,
+        now_ms: u64,
+        ttl_ms: u64,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>> {
         let handle = handle.to_owned();
-        let cutoff_i64 = i64::try_from(active_cutoff_ms).unwrap_or(i64::MAX);
+        let cutoff_i64 = i64::try_from(now_ms.saturating_sub(ttl_ms)).unwrap_or(i64::MAX);
         Box::pin(async move {
             self.handle
                 .run(move |conn| {
@@ -547,9 +557,10 @@ impl RegistrationStore for SqliteStore {
 
     fn prune_expired<'a>(
         &'a self,
-        active_cutoff_ms: u64,
+        now_ms: u64,
+        ttl_ms: u64,
     ) -> BoxFuture<'a, Result<usize, StoreError>> {
-        let cutoff_i64 = i64::try_from(active_cutoff_ms).unwrap_or(i64::MAX);
+        let cutoff_i64 = i64::try_from(now_ms.saturating_sub(ttl_ms)).unwrap_or(i64::MAX);
         Box::pin(async move {
             self.handle
                 .run(move |conn| {
@@ -582,6 +593,29 @@ impl RegistrationStore for SqliteStore {
         })
     }
 
+    fn delete_if_not_newer_than<'a>(
+        &'a self,
+        handle: &'a str,
+        max_last_active_ms: u64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let handle = handle.to_owned();
+        let max_i64 = i64::try_from(max_last_active_ms).unwrap_or(i64::MAX);
+        Box::pin(async move {
+            self.handle
+                .run(move |conn| {
+                    let deleted = conn
+                        .execute(
+                            "DELETE FROM registrations \
+                             WHERE handle = ?1 AND last_active_at_ms <= ?2",
+                            params![&handle, max_i64],
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    Ok(deleted > 0)
+                })
+                .await
+        })
+    }
+
     fn ping(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             self.handle
@@ -599,7 +633,7 @@ impl RegistrationStore for SqliteStore {
 /// Durable SQLite-backed [`ReplayStore`] for single-instance deployments.
 ///
 /// Persists nonces in the `webhook_nonces` table so replay protection survives restarts,
-/// enforces a hard live-entry cap without ever evicting live nonces (`503` when full),
+/// enforces both per-handle and global live-entry caps without ever evicting live nonces,
 /// and guards in-process entries with monotonic time so forward-and-back wall-clock jumps
 /// cannot reopen a replay.
 #[derive(Clone, Debug)]
@@ -607,21 +641,29 @@ pub struct SqliteReplayStore {
     handle: SqliteHandle,
     ttl_ms: u64,
     max_entries: usize,
+    max_per_handle: usize,
     boot_id: [u8; 16],
 }
 
 impl SqliteReplayStore {
     /// Initializes the durable `webhook_nonces` table on `handle` using the standard
-    /// 10-minute [`NONCE_TTL_MS`] window and `max_entries` cap.
+    /// 10-minute [`NONCE_TTL_MS`] window, `max_entries` global cap, and
+    /// [`DEFAULT_MAX_NONCES_PER_HANDLE`].
     ///
     /// # Errors
     ///
     /// Returns [`ReplayError::Backend`] if schema initialization or RNG fails.
     pub async fn new(handle: SqliteHandle, max_entries: usize) -> Result<Self, ReplayError> {
-        Self::with_ttl(handle, NONCE_TTL_MS, max_entries).await
+        Self::with_limits(
+            handle,
+            NONCE_TTL_MS,
+            max_entries,
+            DEFAULT_MAX_NONCES_PER_HANDLE,
+        )
+        .await
     }
 
-    /// Initializes the durable `webhook_nonces` table with a custom TTL and cap.
+    /// Initializes the durable `webhook_nonces` table with a custom TTL and global cap.
     ///
     /// # Errors
     ///
@@ -630,6 +672,21 @@ impl SqliteReplayStore {
         handle: SqliteHandle,
         ttl_ms: u64,
         max_entries: usize,
+    ) -> Result<Self, ReplayError> {
+        Self::with_limits(handle, ttl_ms, max_entries, DEFAULT_MAX_NONCES_PER_HANDLE).await
+    }
+
+    /// Initializes the durable `webhook_nonces` table with explicit TTL, global cap, and
+    /// per-handle active-nonce cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplayError::Backend`] if schema initialization or RNG fails.
+    pub async fn with_limits(
+        handle: SqliteHandle,
+        ttl_ms: u64,
+        max_entries: usize,
+        max_per_handle: usize,
     ) -> Result<Self, ReplayError> {
         let mut boot_id = [0u8; 16];
         getrandom::fill(&mut boot_id)
@@ -643,21 +700,73 @@ impl SqliteReplayStore {
             handle,
             ttl_ms,
             max_entries: max_entries.max(1),
+            max_per_handle: max_per_handle.max(1),
             boot_id,
         })
+    }
+
+    /// Returns the total number of rows currently stored in `webhook_nonces` (read-only).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplayError::Backend`] if the query fails.
+    pub async fn row_count(&self) -> Result<usize, ReplayError> {
+        self.handle
+            .run(|conn| {
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM webhook_nonces", [], |r| r.get(0))
+                    .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                Ok(usize::try_from(count).unwrap_or(usize::MAX))
+            })
+            .await
     }
 }
 
 impl ReplayStore for SqliteReplayStore {
+    fn contains_live<'a>(
+        &'a self,
+        nonce: [u8; 16],
+        wall_now_ms: u64,
+        mono_now_ms: u64,
+    ) -> BoxFuture<'a, Result<bool, ReplayError>> {
+        let boot_id = self.boot_id;
+        let wall_i64 = i64::try_from(wall_now_ms).unwrap_or(i64::MAX);
+        let mono_i64 = i64::try_from(mono_now_ms).unwrap_or(i64::MAX);
+        Box::pin(async move {
+            self.handle
+                .run(move |conn| {
+                    // Row is live iff it exists and is NOT conservatively expired.
+                    let found: Option<i64> = conn
+                        .query_row(
+                            "SELECT 1 FROM webhook_nonces \
+                             WHERE nonce = ?1 \
+                               AND NOT ( \
+                                   (boot_id != ?2 AND expires_at_ms <= ?3) \
+                                   OR (boot_id = ?2 AND expires_at_ms <= ?3 AND mono_expires_ms <= ?4) \
+                               )",
+                            params![nonce.as_slice(), boot_id.as_slice(), wall_i64, mono_i64],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                    Ok(found.is_some())
+                })
+                .await
+        })
+    }
+
     fn check_and_record<'a>(
         &'a self,
+        handle: &'a str,
         nonce: [u8; 16],
         wall_now_ms: u64,
         mono_now_ms: u64,
     ) -> BoxFuture<'a, Result<bool, ReplayError>> {
         let ttl_ms = self.ttl_ms;
         let max_entries = self.max_entries;
+        let max_per_handle = self.max_per_handle;
         let boot_id = self.boot_id;
+        let handle_hash = handle_replay_hash(handle);
         Box::pin(async move {
             let wall_i64 = i64::try_from(wall_now_ms)
                 .map_err(|_| ReplayError::Backend("wall_now_ms overflows i64".to_owned()))?;
@@ -697,6 +806,21 @@ impl ReplayStore for SqliteReplayStore {
                         return Ok(false);
                     }
 
+                    // Enforce per-handle active-nonce cap so one noisy handle cannot exhaust
+                    // shared replay capacity.
+                    let handle_live: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM webhook_nonces WHERE handle_hash = ?1",
+                            params![handle_hash.as_slice()],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                    if usize::try_from(handle_live).unwrap_or(usize::MAX) >= max_per_handle {
+                        tx.commit()
+                            .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                        return Err(ReplayError::HandleCapacityExceeded);
+                    }
+
                     // Never evict live nonces when full; refuse new webhooks with 503.
                     let live_count: i64 = tx
                         .query_row("SELECT COUNT(*) FROM webhook_nonces", [], |r| r.get(0))
@@ -708,9 +832,16 @@ impl ReplayStore for SqliteReplayStore {
                     }
 
                     tx.execute(
-                        "INSERT INTO webhook_nonces (nonce, expires_at_ms, boot_id, mono_expires_ms) \
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![nonce.as_slice(), wall_exp, boot_id.as_slice(), mono_exp],
+                        "INSERT INTO webhook_nonces \
+                         (nonce, expires_at_ms, boot_id, mono_expires_ms, handle_hash) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            nonce.as_slice(),
+                            wall_exp,
+                            boot_id.as_slice(),
+                            mono_exp,
+                            handle_hash.as_slice()
+                        ],
                     )
                     .map_err(|e| ReplayError::Backend(e.to_string()))?;
 
@@ -870,18 +1001,25 @@ mod tests {
 
         {
             let store = SqliteStore::open(path_str).await.unwrap();
-            let replay = SqliteReplayStore::new(store.pool().clone(), 2)
+            let replay = SqliteReplayStore::with_limits(store.pool().clone(), NONCE_TTL_MS, 2, 2)
                 .await
                 .unwrap();
-            assert!(replay.check_and_record(n1, 10_000, 0).await.unwrap());
-            assert!(replay.check_and_record(n2, 10_000, 0).await.unwrap());
+            assert!(!replay.contains_live(n1, 10_000, 0).await.unwrap());
+            assert!(replay.check_and_record("h1", n1, 10_000, 0).await.unwrap());
+            assert!(replay.contains_live(n1, 10_000, 0).await.unwrap());
+            assert!(replay.check_and_record("h2", n2, 10_000, 0).await.unwrap());
 
             // Full: fresh nonce returns CapacityExceeded (503); live nonces still return false (409).
             assert!(matches!(
-                replay.check_and_record(n3, 10_000, 100).await,
+                replay.check_and_record("h3", n3, 10_000, 100).await,
                 Err(ReplayError::CapacityExceeded)
             ));
-            assert!(!replay.check_and_record(n1, 10_000, 100).await.unwrap());
+            assert!(
+                !replay
+                    .check_and_record("h1", n1, 10_000, 100)
+                    .await
+                    .unwrap()
+            );
 
             // Forward-and-back wall clock jump cannot expire live nonces in-process.
             assert_eq!(
@@ -891,21 +1029,40 @@ mod tests {
                     .unwrap(),
                 0
             );
-            assert!(!replay.check_and_record(n1, 12_000, 6_000).await.unwrap());
+            assert!(replay.contains_live(n1, 12_000, 6_000).await.unwrap());
+            assert!(
+                !replay
+                    .check_and_record("h1", n1, 12_000, 6_000)
+                    .await
+                    .unwrap()
+            );
         }
 
         // Simulate process restart by reopening the same SQLite database file.
         let reopened = SqliteStore::open(path_str).await.unwrap();
-        let replay2 = SqliteReplayStore::new(reopened.pool().clone(), 2)
+        let replay2 = SqliteReplayStore::with_limits(reopened.pool().clone(), NONCE_TTL_MS, 2, 1)
             .await
             .unwrap();
-        assert!(!replay2.check_and_record(n1, 20_000, 0).await.unwrap());
-        assert!(!replay2.check_and_record(n2, 20_000, 0).await.unwrap());
+        assert!(!replay2.check_and_record("h1", n1, 20_000, 0).await.unwrap());
+        assert!(!replay2.check_and_record("h2", n2, 20_000, 0).await.unwrap());
 
         // After 10-minute wall TTL passes across restart, nonces expire cleanly.
         assert!(
             replay2
-                .check_and_record(n3, 10_000 + NONCE_TTL_MS, 0)
+                .check_and_record("h3", n3, 10_000 + NONCE_TTL_MS, 0)
+                .await
+                .unwrap()
+        );
+        // Per-handle cap (1) isolates h3 while allowing h4!
+        assert!(matches!(
+            replay2
+                .check_and_record("h3", [4u8; 16], 10_000 + NONCE_TTL_MS, 0)
+                .await,
+            Err(ReplayError::HandleCapacityExceeded)
+        ));
+        assert!(
+            replay2
+                .check_and_record("h4", [4u8; 16], 10_000 + NONCE_TTL_MS, 0)
                 .await
                 .unwrap()
         );
@@ -932,7 +1089,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(versions, vec![(1, "initial".to_owned())]);
+        assert_eq!(
+            versions,
+            vec![
+                (1, "initial".to_owned()),
+                (2, "replay_handle_hash".to_owned())
+            ]
+        );
 
         // Re-opening is idempotent.
         let store2 = SqliteStore::open(path_str).await.unwrap();

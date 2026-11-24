@@ -110,10 +110,15 @@ pub enum PushOutcome {
     /// Upstream push gateway accepted the wake push.
     Delivered,
     /// Upstream push gateway returned token-specific evidence that the device token is
-    /// permanently invalid or unregistered; the relay should delete the handle.
+    /// permanently invalid or unregistered; the relay should delete the handle (subject to
+    /// `invalidated_at_ms` when present).
     InvalidToken {
         /// Fixed token-rejection classification.
         class: InvalidTokenClass,
+        /// Optional provider invalidation timestamp in Unix milliseconds (e.g. APNs `410`
+        /// `timestamp` field). When present, the handle is deleted only if its
+        /// `last_active_at_ms <= invalidated_at_ms`.
+        invalidated_at_ms: Option<u64>,
     },
 }
 
@@ -235,8 +240,8 @@ pub trait PushSender: Send + Sync {
     ///
     /// Returns [`PushError`] if credentials are missing, cannot sign, or have been rejected by
     /// the upstream provider.
-    fn check_ready(&self) -> Result<(), PushError> {
-        Ok(())
+    fn check_ready(&self) -> BoxFuture<'_, Result<(), PushError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -303,17 +308,19 @@ impl PushSender for RouterPushSender {
         })
     }
 
-    fn check_ready(&self) -> Result<(), PushError> {
-        if !self.has_any_provider() {
-            return Err(PushError::Config("no push providers configured".to_owned()));
-        }
-        if let Some(apns) = &self.apns {
-            apns.check_ready()?;
-        }
-        if let Some(fcm) = &self.fcm {
-            fcm.check_ready()?;
-        }
-        Ok(())
+    fn check_ready(&self) -> BoxFuture<'_, Result<(), PushError>> {
+        Box::pin(async move {
+            if !self.has_any_provider() {
+                return Err(PushError::Config("no push providers configured".to_owned()));
+            }
+            if let Some(apns) = &self.apns {
+                apns.check_ready().await?;
+            }
+            if let Some(fcm) = &self.fcm {
+                fcm.check_ready().await?;
+            }
+            Ok(())
+        })
     }
 }
 

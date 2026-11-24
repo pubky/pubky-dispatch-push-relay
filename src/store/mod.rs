@@ -154,13 +154,24 @@ pub struct RegistrationLimits {
 }
 
 /// Result of an idempotent registration operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Redacts the opaque handle in [`fmt::Debug`] so handles never leak into debug output.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RegisterOutcome {
     /// A brand-new opaque handle was created.
     Created(String),
     /// An active registration for the same `(platform, device_token, push_key, apns_env)`
     /// already existed and its existing handle was returned unchanged.
     Existing(String),
+}
+
+impl fmt::Debug for RegisterOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created(_) => f.write_str("Created(<redacted>)"),
+            Self::Existing(_) => f.write_str("Existing(<redacted>)"),
+        }
+    }
 }
 
 impl RegisterOutcome {
@@ -226,11 +237,13 @@ pub trait RegistrationStore: Send + Sync {
         handle: &'a str,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>>;
 
-    /// Looks up a registration only if it is active (`last_active_at_ms > active_cutoff_ms`).
+    /// Looks up a registration only if it is active within `ttl_ms` of the authoritative clock
+    /// (`now_ms` on SQLite; PostgreSQL `clock_timestamp()` on PostgreSQL).
     fn get_active<'a>(
         &'a self,
         handle: &'a str,
-        active_cutoff_ms: u64,
+        now_ms: u64,
+        ttl_ms: u64,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>>;
 
     /// Advances `last_active_at_ms` for `handle` after a valid webhook delivery.
@@ -243,9 +256,23 @@ pub trait RegistrationStore: Send + Sync {
     /// Deletes a registration by handle, returning `true` if a row was removed.
     fn delete<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, Result<bool, StoreError>>;
 
-    /// Deletes registrations whose `last_active_at_ms <= cutoff_ms`, returning how many
+    /// Deletes a registration by handle ONLY if its `last_active_at_ms <= max_last_active_ms`,
+    /// returning `true` if a row was removed and `false` if absent or superseded by a newer
+    /// registration/renewal (for example when a delayed APNs `410` carries an older timestamp).
+    fn delete_if_not_newer_than<'a>(
+        &'a self,
+        handle: &'a str,
+        max_last_active_ms: u64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Deletes registrations inactive for at least `ttl_ms` relative to the authoritative clock
+    /// (`now_ms` on SQLite; PostgreSQL `clock_timestamp()` on PostgreSQL), returning how many
     /// rows were removed.
-    fn prune_expired<'a>(&'a self, cutoff_ms: u64) -> BoxFuture<'a, Result<usize, StoreError>>;
+    fn prune_expired<'a>(
+        &'a self,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> BoxFuture<'a, Result<usize, StoreError>>;
 
     /// Verifies storage availability for health checks.
     fn ping<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>>;
@@ -271,6 +298,19 @@ mod tests {
         assert!(!rendered.contains("deadbeef"));
         assert!(!rendered.contains("66, 66"));
         assert!(rendered.contains("<redacted>"));
+
+        let created = format!(
+            "{:?}",
+            RegisterOutcome::Created("secret-handle-1".to_owned())
+        );
+        let existing = format!(
+            "{:?}",
+            RegisterOutcome::Existing("secret-handle-2".to_owned())
+        );
+        assert!(!created.contains("secret-handle-1"));
+        assert!(!existing.contains("secret-handle-2"));
+        assert_eq!(created, "Created(<redacted>)");
+        assert_eq!(existing, "Existing(<redacted>)");
     }
 
     #[test]

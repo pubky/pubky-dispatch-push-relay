@@ -24,10 +24,13 @@ use pubky_dispatch_push_relay::config::{ProtocolConfig, RelaySettings};
 use pubky_dispatch_push_relay::crypto::{
     SIGNATURE_HEADER, SIGNING_LABEL, b64_decode_array, b64_encode, relay_origin, sign_webhook,
 };
-use pubky_dispatch_push_relay::http::{MAX_TIMESTAMP_SKEW_MS, RelayState, metrics_router, router};
+use pubky_dispatch_push_relay::http::{
+    MAX_TIMESTAMP_SKEW_MS, RateLimitBackends, RelayState, metrics_router, router,
+};
 use pubky_dispatch_push_relay::metrics::{RegistrationOutcome, WebhookOutcome};
 use pubky_dispatch_push_relay::push::noop::RecordingSender;
 use pubky_dispatch_push_relay::push::{InvalidTokenClass, PushOutcome, UpstreamErrorClass};
+use pubky_dispatch_push_relay::rate_limit::RateLimiter;
 use pubky_dispatch_push_relay::replay::NONCE_TTL_MS;
 use pubky_dispatch_push_relay::store::sqlite::{SqliteReplayStore, SqliteStore};
 use pubky_dispatch_push_relay::store::{
@@ -43,6 +46,7 @@ struct TestApp {
     state: RelayState,
     router: Router,
     store: Arc<SqliteStore>,
+    replay: Arc<SqliteReplayStore>,
     sender: Arc<RecordingSender>,
     clock: Arc<FixedClock>,
     origin: String,
@@ -52,9 +56,14 @@ impl TestApp {
     async fn new(settings: RelaySettings) -> Self {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         let replay = Arc::new(
-            SqliteReplayStore::new(store.pool().clone(), settings.nonce_cache_max_entries)
-                .await
-                .unwrap(),
+            SqliteReplayStore::with_limits(
+                store.pool().clone(),
+                NONCE_TTL_MS,
+                settings.nonce_cache_max_entries,
+                settings.max_nonces_per_handle,
+            )
+            .await
+            .unwrap(),
         );
         let limiters = RelayState::in_memory_limiters(&settings);
         let sender = Arc::new(RecordingSender::new());
@@ -64,7 +73,7 @@ impl TestApp {
             store.clone(),
             sender.clone(),
             clock.clone(),
-            replay,
+            replay.clone(),
             limiters,
             settings,
         );
@@ -73,6 +82,7 @@ impl TestApp {
             state,
             router,
             store,
+            replay,
             sender,
             clock,
             origin,
@@ -209,6 +219,7 @@ impl RegistrationStore for FailingStore {
         &'a self,
         _: &'a str,
         _: u64,
+        _: u64,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>> {
         Box::pin(async { Err(StoreError::Backend("offline".to_owned())) })
     }
@@ -222,7 +233,14 @@ impl RegistrationStore for FailingStore {
     fn delete<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<bool, StoreError>> {
         Box::pin(async { Err(StoreError::Backend("offline".to_owned())) })
     }
-    fn prune_expired<'a>(&'a self, _: u64) -> BoxFuture<'a, Result<usize, StoreError>> {
+    fn delete_if_not_newer_than<'a>(
+        &'a self,
+        _: &'a str,
+        _: u64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async { Err(StoreError::Backend("offline".to_owned())) })
+    }
+    fn prune_expired<'a>(&'a self, _: u64, _: u64) -> BoxFuture<'a, Result<usize, StoreError>> {
         Box::pin(async { Err(StoreError::Backend("offline".to_owned())) })
     }
     fn ping<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>> {
@@ -426,8 +444,13 @@ async fn hook_enforces_all_six_wire_format_8_3_rules_and_ordering() {
         assert_eq!(b["code"], "bad_request");
     }
 
-    // --- Rule 2: unknown handle -> 404 (checked before signature), including empty or control-char strings per Wire §1.7 / §8.3 ---
-    for unknown_handle in ["unknownHandle123456789", "", r"\u0007bad"] {
+    // --- Rule 2: unknown handle -> 404 (checked before signature), including empty, NUL-byte, or control-char strings per Wire §1.7 / §8.3 ---
+    for unknown_handle in [
+        "unknownHandle123456789",
+        "",
+        r"\u0007bad",
+        r"bad\u0000handle",
+    ] {
         let unknown_body =
             format!(r#"{{"v":1,"handle":"{unknown_handle}","ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#);
         let (s, _, b) = app
@@ -951,11 +974,12 @@ async fn register_enforces_per_ip_per_key_global_rate_limits_and_trusted_proxies
     assert!(headers.get("retry-after").is_some());
 
     // Another client IP is unaffected because per-IP blocked the attacker before global!
-    // Requests via trusted proxy 10.0.0.5 honour rightmost untrusted hop in X-Forwarded-For.
+    // Requests via trusted proxy 10.0.0.5 parse X-Forwarded-For strictly right-to-left,
+    // skipping trusted hops and ignoring malformed attacker entries to the left.
     assert_eq!(
         app.register_from(
             ip_proxy,
-            Some("9.9.9.9, 203.0.113.1"),
+            Some("garbage, 203.0.113.1, 10.0.0.9"),
             "fcm",
             "t4",
             &key_a,
@@ -1181,6 +1205,7 @@ async fn upstream_error_returns_502_and_invalid_token_prunes_handle() {
 
     app.sender.enqueue_outcome(PushOutcome::InvalidToken {
         class: InvalidTokenClass::FcmUnregistered,
+        invalidated_at_ms: None,
     });
     let (s, _, b) = app
         .post_signed_hook(&key, &handle, BASE_TIME_MS, [21; 16])
@@ -1221,6 +1246,7 @@ async fn register_enforces_max_registrations_cap_and_recovers_after_prune() {
 
     app.sender.enqueue_outcome(PushOutcome::InvalidToken {
         class: InvalidTokenClass::FcmUnregistered,
+        invalidated_at_ms: None,
     });
     let (sh, _, bh) = app
         .post_signed_hook(&key, &handle1, BASE_TIME_MS, [90; 16])
@@ -1231,6 +1257,12 @@ async fn register_enforces_max_registrations_cap_and_recovers_after_prune() {
     let (s4, b4) = app.register("fcm", "cap_token_3", &key, None).await;
     assert_eq!(s4, StatusCode::OK);
     let handle3 = b4["handle"].as_str().unwrap().to_owned();
+
+    assert_eq!(
+        app.replay.row_count().await.unwrap(),
+        1,
+        "expected recorded nonce row in SQLite before prune_caches"
+    );
 
     // Advance clock past both nonce TTL (10 min) and registration inactivity TTL, then sweep:
     // verify expired nonces and expired registrations are actually removed from storage.
@@ -1245,13 +1277,18 @@ async fn register_enforces_max_registrations_cap_and_recovers_after_prune() {
         app.store.get(&handle3).await.unwrap().is_none(),
         "prune_caches must delete expired handle3"
     );
+    assert_eq!(
+        app.replay.row_count().await.unwrap(),
+        0,
+        "prune_caches must actually delete expired nonce rows from webhook_nonces"
+    );
     assert!(
         app.state
             .replay_store()
-            .check_and_record([90; 16], after_ttl, app.clock.monotonic_ms())
+            .check_and_record(&handle1, [90; 16], after_ttl, app.clock.monotonic_ms())
             .await
             .unwrap(),
-        "prune_caches must remove expired nonce [90; 16]"
+        "expired nonce [90; 16] can be re-recorded after prune"
     );
 }
 
@@ -1336,6 +1373,7 @@ async fn metrics_endpoint_tracks_all_outcomes_and_omits_sensitive_labels() {
     app.clock.set(t_next);
     app.sender.enqueue_outcome(PushOutcome::InvalidToken {
         class: InvalidTokenClass::FcmUnregistered,
+        invalidated_at_ms: None,
     });
     let (s, _, _) = app.post_signed_hook(&key, &handle, t_next, [7; 16]).await;
     assert_eq!(s, StatusCode::OK);
@@ -1425,4 +1463,263 @@ async fn metrics_endpoint_tracks_all_outcomes_and_omits_sensitive_labels() {
     assert!(!body.contains(secret_token));
     assert!(!body.contains(&push_key_b64));
     assert!(!body.contains("127.0.0.1"));
+}
+
+#[tokio::test]
+async fn rate_limited_hooks_preserve_409_order_do_not_fill_replay_and_isolate_per_handle() {
+    let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    settings.rate_limit_per_minute = 2;
+    settings.max_nonces_per_handle = 3;
+    settings.nonce_cache_max_entries = 10;
+    let app = TestApp::new(settings).await;
+
+    let key_noisy = key_from_seed(101);
+    let key_victim = key_from_seed(102);
+    let (_, reg_noisy) = app.register("fcm", "noisy-tok", &key_noisy, None).await;
+    let (_, reg_victim) = app.register("fcm", "victim-tok", &key_victim, None).await;
+    let h_noisy = reg_noisy["handle"].as_str().unwrap().to_owned();
+    let h_victim = reg_victim["handle"].as_str().unwrap().to_owned();
+
+    // Consume h_noisy's 2/min rate limit.
+    assert_eq!(
+        app.post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [1; 16])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [2; 16])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(app.replay.row_count().await.unwrap(), 2);
+
+    // 1. Wire §8.3 order preserved: replaying a seen nonce while rate-limited returns 409 (not 429).
+    let (s, _, b) = app
+        .post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [1; 16])
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(b["code"], "nonce_replay");
+
+    // 2. Flood of fresh nonces from rate-limited handle returns 429 WITHOUT inserting rows
+    //    into the shared replay table!
+    for i in 10u8..30u8 {
+        let (s, _, b) = app
+            .post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [i; 16])
+            .await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(b["code"], "rate_limited");
+    }
+    assert_eq!(
+        app.replay.row_count().await.unwrap(),
+        2,
+        "rate-limited webhooks must not insert rows into webhook_nonces"
+    );
+
+    // 3. Advance 61s so rate window resets while original 2 nonces are still live in 10-min TTL.
+    //    h_noisy can record 1 more nonce (total 3 = max_nonces_per_handle); 4th is throttled
+    //    by per-handle cap (429), while unrelated h_victim still succeeds (200)!
+    let t_next = BASE_TIME_MS + 61_000;
+    app.clock.set(t_next);
+    assert_eq!(
+        app.post_signed_hook(&key_noisy, &h_noisy, t_next, [3; 16])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (s, headers, b) = app
+        .post_signed_hook(&key_noisy, &h_noisy, t_next, [4; 16])
+        .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(b["code"], "rate_limited");
+    assert!(headers.get("retry-after").is_some());
+
+    // Unrelated handle is completely isolated from h_noisy's per-handle replay cap.
+    let (s_victim, _, b_victim) = app
+        .post_signed_hook(&key_victim, &h_victim, t_next, [5; 16])
+        .await;
+    assert_eq!(s_victim, StatusCode::OK);
+    assert_eq!(b_victim["delivered"], true);
+}
+
+#[tokio::test]
+async fn register_global_limit_blocks_before_creating_ip_or_key_buckets() {
+    let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    settings.register_rate_limit_per_minute = 2;
+    settings.register_ip_rate_limit_per_minute = 10;
+    settings.register_key_rate_limit_per_minute = 10;
+
+    let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let replay = Arc::new(
+        SqliteReplayStore::with_limits(
+            store.pool().clone(),
+            NONCE_TTL_MS,
+            settings.nonce_cache_max_entries,
+            settings.max_nonces_per_handle,
+        )
+        .await
+        .unwrap(),
+    );
+    let ip_limiter = Arc::new(RateLimiter::new(
+        settings.register_ip_rate_limit_per_minute,
+        100,
+    ));
+    let key_limiter = Arc::new(RateLimiter::new(
+        settings.register_key_rate_limit_per_minute,
+        100,
+    ));
+    let global_limiter = Arc::new(RateLimiter::new(settings.register_rate_limit_per_minute, 1));
+    let limiters = RateLimitBackends {
+        hook_per_handle: Arc::new(RateLimiter::new(settings.rate_limit_per_minute, 100)),
+        register_per_ip: ip_limiter.clone(),
+        register_per_key: key_limiter.clone(),
+        register_global: global_limiter,
+    };
+
+    let state = RelayState::with_backends(
+        store,
+        Arc::new(RecordingSender::new()),
+        Arc::new(FixedClock::new(BASE_TIME_MS)),
+        replay,
+        limiters,
+        settings,
+    );
+    let app = router(state);
+
+    let send_reg = |ip_last: u8, seed: u8, token: &str| {
+        let app = app.clone();
+        let token = token.to_owned();
+        async move {
+            let key = key_from_seed(seed);
+            let payload = json!({
+                "platform": "fcm",
+                "device_token": token,
+                "push_key": b64_encode(&key.verifying_key().to_bytes()),
+            });
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/v1/register")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, ip_last)),
+                44321,
+            )));
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // First 2 registrations succeed and saturate the global registration cap.
+    assert_eq!(send_reg(1, 111, "tok-1").await, StatusCode::OK);
+    assert_eq!(send_reg(2, 112, "tok-2").await, StatusCode::OK);
+    let ip_buckets_at_cap = ip_limiter.tracked_handles();
+    let key_buckets_at_cap = key_limiter.tracked_handles();
+    assert_eq!(ip_buckets_at_cap, 2);
+    assert_eq!(key_buckets_at_cap, 2);
+
+    // Additional requests from fresh IPs and fresh push keys MUST fail at global check BEFORE
+    // inserting any per-IP or per-key buckets.
+    for i in 3u8..10u8 {
+        assert_eq!(
+            send_reg(i, 120 + i, &format!("tok-{i}")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        ip_limiter.tracked_handles(),
+        ip_buckets_at_cap,
+        "global limit must short-circuit before creating per-IP buckets"
+    );
+    assert_eq!(
+        key_limiter.tracked_handles(),
+        key_buckets_at_cap,
+        "global limit must short-circuit before creating per-key buckets"
+    );
+}
+
+#[tokio::test]
+async fn stale_apns_410_timestamp_preserves_reregistered_handle() {
+    let app = TestApp::default_dispatch().await;
+    let key = key_from_seed(131);
+    let token = apns_token('d');
+
+    // Register at T0.
+    let (s, reg) = app.register("apns", &token, &key, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let handle = reg["handle"].as_str().unwrap().to_owned();
+
+    // Re-register the same device at T0 + 5_000ms (updating last_active_at_ms to T0 + 5_000).
+    let t_renew = BASE_TIME_MS + 5_000;
+    app.clock.set(t_renew);
+    let (s2, reg2) = app.register("apns", &token, &key, None).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(reg2["handle"].as_str().unwrap(), handle);
+
+    // Delayed APNs 410 Unregistered with timestamp older than last_active_at_ms MUST NOT delete.
+    app.sender.enqueue_outcome(PushOutcome::InvalidToken {
+        class: InvalidTokenClass::ApnsUnregistered,
+        invalidated_at_ms: Some(BASE_TIME_MS + 1_000),
+    });
+    let (s, _, b) = app
+        .post_signed_hook(&key, &handle, t_renew, [131; 16])
+        .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(b["code"], "upstream_error");
+    assert!(
+        app.store.get(&handle).await.unwrap().is_some(),
+        "stale APNs 410 timestamp must preserve re-registered handle"
+    );
+
+    // APNs 410 Unregistered with timestamp >= last_active_at_ms prunes cleanly.
+    app.sender.enqueue_outcome(PushOutcome::InvalidToken {
+        class: InvalidTokenClass::ApnsUnregistered,
+        invalidated_at_ms: Some(t_renew),
+    });
+    let (s, _, b) = app
+        .post_signed_hook(&key, &handle, t_renew, [132; 16])
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["delivered"], false);
+    assert_eq!(b["pruned"], true);
+    assert!(app.store.get(&handle).await.unwrap().is_none());
+}
+
+#[test]
+fn cli_binary_help_hides_secret_env_values_when_set() {
+    let secret_db = "postgres://relay:SUPER_SECRET_DB_PASS@db.internal/relay";
+    let secret_apns_path = "/run/secrets/SUPER_SECRET_APNS_KEY.p8";
+    let secret_fcm_path = "/run/secrets/SUPER_SECRET_FCM_SA.json";
+    let secret_apns_pem = "SUPER_SECRET_INLINE_APNS_PEM_MATERIAL";
+    let secret_fcm_json = "SUPER_SECRET_INLINE_FCM_JSON_MATERIAL";
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pubky-dispatch-push-relay"))
+        .arg("--help")
+        .env("DATABASE_URL", secret_db)
+        .env("APNS_KEY_PATH", secret_apns_path)
+        .env("FCM_SERVICE_ACCOUNT_PATH", secret_fcm_path)
+        .env("APNS_KEY_PEM", secret_apns_pem)
+        .env("FCM_SERVICE_ACCOUNT_JSON", secret_fcm_json)
+        .output()
+        .expect("run binary --help");
+    assert!(output.status.success(), "--help must exit 0");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in [
+        secret_db,
+        secret_apns_path,
+        secret_fcm_path,
+        secret_apns_pem,
+        secret_fcm_json,
+    ] {
+        assert!(
+            !combined.contains(secret),
+            "binary --help leaked env secret {secret:?}"
+        );
+    }
 }

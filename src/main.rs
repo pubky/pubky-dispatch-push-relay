@@ -18,7 +18,8 @@ use pubky_dispatch_push_relay::push::apns::ApnsSender;
 use pubky_dispatch_push_relay::push::fcm::FcmSender;
 use pubky_dispatch_push_relay::push::noop::NoopSender;
 use pubky_dispatch_push_relay::push::{PushSender, RouterPushSender};
-use pubky_dispatch_push_relay::replay::ReplayStore;
+use pubky_dispatch_push_relay::rate_limit::RATE_WINDOW_MS;
+use pubky_dispatch_push_relay::replay::{NONCE_TTL_MS, ReplayStore};
 use pubky_dispatch_push_relay::store::is_postgres_url;
 use pubky_dispatch_push_relay::store::postgres::{
     PostgresRateLimitStore, PostgresReplayStore, PostgresStore,
@@ -80,34 +81,52 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         let pg_store = Arc::new(PostgresStore::open(database_url.as_str()).await?);
         let pool = pg_store.pool().clone();
         let replay: Arc<dyn ReplayStore> = Arc::new(
-            PostgresReplayStore::new(pool.clone(), settings.nonce_cache_max_entries).await?,
+            PostgresReplayStore::with_limits(
+                pool.clone(),
+                NONCE_TTL_MS,
+                settings.nonce_cache_max_entries,
+                settings.max_nonces_per_handle,
+            )
+            .await?,
         );
         let limiters = RateLimitBackends {
             hook_per_handle: Arc::new(
-                PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
-                    .await?,
+                PostgresRateLimitStore::with_limits(
+                    pool.clone(),
+                    "hook",
+                    RATE_WINDOW_MS,
+                    settings.rate_limit_per_minute,
+                    settings.rate_limit_max_handles,
+                )
+                .await?,
             ),
             register_per_ip: Arc::new(
-                PostgresRateLimitStore::new(
+                PostgresRateLimitStore::with_limits(
                     pool.clone(),
                     "register_ip",
+                    RATE_WINDOW_MS,
                     settings.register_ip_rate_limit_per_minute,
+                    settings.rate_limit_max_handles,
                 )
                 .await?,
             ),
             register_per_key: Arc::new(
-                PostgresRateLimitStore::new(
+                PostgresRateLimitStore::with_limits(
                     pool.clone(),
                     "register_key",
+                    RATE_WINDOW_MS,
                     settings.register_key_rate_limit_per_minute,
+                    settings.rate_limit_max_handles,
                 )
                 .await?,
             ),
             register_global: Arc::new(
-                PostgresRateLimitStore::new(
+                PostgresRateLimitStore::with_limits(
                     pool,
                     "register_global",
+                    RATE_WINDOW_MS,
                     settings.register_rate_limit_per_minute,
+                    1,
                 )
                 .await?,
             ),
@@ -129,9 +148,11 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let sqlite_store = Arc::new(SqliteStore::open(database_url.as_str()).await?);
         let replay: Arc<dyn ReplayStore> = Arc::new(
-            SqliteReplayStore::new(
+            SqliteReplayStore::with_limits(
                 sqlite_store.pool().clone(),
+                NONCE_TTL_MS,
                 settings.nonce_cache_max_entries,
+                settings.max_nonces_per_handle,
             )
             .await?,
         );
