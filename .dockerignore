@@ -1,0 +1,10 @@
+/target
+/data
+.git
+.github
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.p8
+.env
+.DS_Store

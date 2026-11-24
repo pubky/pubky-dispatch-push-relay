@@ -1,0 +1,176 @@
+//! Per-handle per-minute sliding-window rate limiter (Wire Format §8.3 rule 6).
+
+use std::collections::{HashMap, VecDeque};
+
+use parking_lot::Mutex;
+
+/// Rate-limit window duration: 60 seconds in milliseconds.
+pub const RATE_WINDOW_MS: u64 = 60_000;
+
+/// Default maximum pushes per handle per minute.
+pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 60;
+
+/// Default cap on simultaneously tracked handles to bound memory usage.
+pub const DEFAULT_MAX_TRACKED_HANDLES: usize = 100_000;
+
+struct LimiterState {
+    buckets: HashMap<String, VecDeque<u64>>,
+}
+
+/// Thread-safe, bounded-memory per-handle sliding-window rate limiter.
+pub struct RateLimiter {
+    window_ms: u64,
+    max_per_window: usize,
+    max_handles: usize,
+    state: Mutex<LimiterState>,
+}
+
+impl std::fmt::Debug for RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimiter")
+            .field("window_ms", &self.window_ms)
+            .field("max_per_window", &self.max_per_window)
+            .field("max_handles", &self.max_handles)
+            .field("tracked_handles", &self.tracked_handles())
+            .finish()
+    }
+}
+
+impl RateLimiter {
+    /// Creates a new sliding-window rate limiter.
+    #[must_use]
+    pub fn new(max_per_minute: u32, max_handles: usize) -> Self {
+        Self::with_window(RATE_WINDOW_MS, max_per_minute, max_handles)
+    }
+
+    /// Creates a rate limiter with a custom window length in milliseconds.
+    #[must_use]
+    pub fn with_window(window_ms: u64, max_per_window: u32, max_handles: usize) -> Self {
+        Self {
+            window_ms: window_ms.max(1),
+            max_per_window: usize::try_from(max_per_window).unwrap_or(usize::MAX),
+            max_handles: max_handles.max(1),
+            state: Mutex::new(LimiterState {
+                buckets: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Attempts to consume one push token for `handle` at `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(retry_after_secs)` (always `>= 1`) when `handle` has reached its
+    /// per-minute limit.
+    pub fn check_and_record(&self, handle: &str, now_ms: u64) -> Result<(), u64> {
+        if self.max_per_window == 0 {
+            return Err(self.window_ms.div_ceil(1_000).max(1));
+        }
+
+        let mut state = self.state.lock();
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+
+        if !state.buckets.contains_key(handle) && state.buckets.len() >= self.max_handles {
+            Self::prune_expired_locked(&mut state, cutoff);
+            if state.buckets.len() >= self.max_handles {
+                Self::evict_oldest_handle_locked(&mut state);
+            }
+        }
+
+        let bucket = state.buckets.entry(handle.to_owned()).or_default();
+        while let Some(&ts) = bucket.front() {
+            if ts <= cutoff {
+                bucket.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if bucket.len() >= self.max_per_window {
+            let oldest = bucket.front().copied().unwrap_or(now_ms);
+            let wait_ms = oldest.saturating_add(self.window_ms).saturating_sub(now_ms);
+            let retry_after_secs = wait_ms.div_ceil(1_000).max(1);
+            return Err(retry_after_secs);
+        }
+
+        bucket.push_back(now_ms);
+        Ok(())
+    }
+
+    /// Drops rate-limit state for a handle (e.g. after dead-token handle pruning).
+    pub fn remove_handle(&self, handle: &str) {
+        self.state.lock().buckets.remove(handle);
+    }
+
+    /// Removes all inactive handles whose timestamps have aged out of the window.
+    pub fn prune_expired(&self, now_ms: u64) -> usize {
+        let mut state = self.state.lock();
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        Self::prune_expired_locked(&mut state, cutoff)
+    }
+
+    /// Returns the number of handles currently tracked in memory.
+    #[must_use]
+    pub fn tracked_handles(&self) -> usize {
+        self.state.lock().buckets.len()
+    }
+
+    fn prune_expired_locked(state: &mut LimiterState, cutoff: u64) -> usize {
+        let before = state.buckets.len();
+        state.buckets.retain(|_, timestamps| {
+            while let Some(&ts) = timestamps.front() {
+                if ts <= cutoff {
+                    timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !timestamps.is_empty()
+        });
+        before.saturating_sub(state.buckets.len())
+    }
+
+    fn evict_oldest_handle_locked(state: &mut LimiterState) {
+        let oldest_key = state
+            .buckets
+            .iter()
+            .min_by_key(|(_, q)| q.back().copied().unwrap_or(0))
+            .map(|(k, _)| k.clone());
+        if let Some(key) = oldest_key {
+            state.buckets.remove(&key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforces_per_handle_sliding_window_and_isolation() {
+        let limiter = RateLimiter::new(2, 100);
+
+        assert_eq!(limiter.check_and_record("h1", 1_000), Ok(()));
+        assert_eq!(limiter.check_and_record("h1", 2_000), Ok(()));
+        assert_eq!(limiter.check_and_record("h1", 2_500), Err(59));
+
+        // Another handle has its own independent quota.
+        assert_eq!(limiter.check_and_record("h2", 2_500), Ok(()));
+
+        // Once the first request ages out of the 60s window, h1 is allowed again.
+        assert_eq!(limiter.check_and_record("h1", 61_000), Ok(()));
+        assert_eq!(limiter.check_and_record("h1", 61_500), Err(1));
+    }
+
+    #[test]
+    fn prunes_stale_handles_and_respects_bound() {
+        let limiter = RateLimiter::new(5, 2);
+        assert!(limiter.check_and_record("h1", 100).is_ok());
+        assert!(limiter.check_and_record("h2", 200).is_ok());
+        assert_eq!(limiter.tracked_handles(), 2);
+
+        // At t = 70_000 both h1 and h2 are stale and get pruned when h3 arrives.
+        assert!(limiter.check_and_record("h3", 70_000).is_ok());
+        assert_eq!(limiter.tracked_handles(), 1);
+    }
+}

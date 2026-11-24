@@ -1,0 +1,101 @@
+//! No-op and recording mock [`PushSender`] implementations for local dev and tests.
+
+use std::collections::VecDeque;
+
+use parking_lot::Mutex;
+
+use crate::push::{PushError, PushOutcome, PushSender};
+use crate::store::{ApnsEnv, BoxFuture, Platform, Registration};
+
+/// No-op push sender for local development without Apple/Google credentials.
+///
+/// Logs push dispatch metadata (platform only; never device tokens or handles) at
+/// `debug` level and reports [`PushOutcome::Delivered`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopSender;
+
+impl PushSender for NoopSender {
+    fn send_wake<'a>(
+        &'a self,
+        registration: &'a Registration,
+    ) -> BoxFuture<'a, Result<PushOutcome, PushError>> {
+        let platform = registration.platform;
+        Box::pin(async move {
+            tracing::debug!(platform = %platform, "noop push sender accepted wake push");
+            Ok(PushOutcome::Delivered)
+        })
+    }
+}
+
+/// Captured wake push dispatch recorded by [`RecordingSender`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedPush {
+    /// Handle that triggered the push.
+    pub handle: String,
+    /// Target mobile platform.
+    pub platform: Platform,
+    /// Target device token.
+    pub device_token: String,
+    /// Optional APNs environment.
+    pub apns_env: Option<ApnsEnv>,
+}
+
+/// Scriptable mock [`PushSender`] for tests.
+#[derive(Default)]
+pub struct RecordingSender {
+    recorded: Mutex<Vec<RecordedPush>>,
+    scripted: Mutex<VecDeque<Result<PushOutcome, String>>>,
+}
+
+impl std::fmt::Debug for RecordingSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingSender")
+            .field("recorded_count", &self.recorded.lock().len())
+            .finish()
+    }
+}
+
+impl RecordingSender {
+    /// Creates a new [`RecordingSender`] that defaults to [`PushOutcome::Delivered`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enqueues an explicit [`PushOutcome`] for the next `send_wake` call.
+    pub fn enqueue_outcome(&self, outcome: PushOutcome) {
+        self.scripted.lock().push_back(Ok(outcome));
+    }
+
+    /// Enqueues an upstream error for the next `send_wake` call.
+    pub fn enqueue_upstream_error(&self, message: impl Into<String>) {
+        self.scripted.lock().push_back(Err(message.into()));
+    }
+
+    /// Returns a snapshot of all recorded wake dispatches.
+    #[must_use]
+    pub fn recorded(&self) -> Vec<RecordedPush> {
+        self.recorded.lock().clone()
+    }
+}
+
+impl PushSender for RecordingSender {
+    fn send_wake<'a>(
+        &'a self,
+        registration: &'a Registration,
+    ) -> BoxFuture<'a, Result<PushOutcome, PushError>> {
+        Box::pin(async move {
+            self.recorded.lock().push(RecordedPush {
+                handle: registration.handle.clone(),
+                platform: registration.platform,
+                device_token: registration.device_token.clone(),
+                apns_env: registration.apns_env,
+            });
+            match self.scripted.lock().pop_front() {
+                Some(Ok(outcome)) => Ok(outcome),
+                Some(Err(msg)) => Err(PushError::Upstream(msg)),
+                None => Ok(PushOutcome::Delivered),
+            }
+        })
+    }
+}
