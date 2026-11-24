@@ -4,17 +4,20 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey as _;
+use base64::Engine as _;
 use parking_lot::Mutex;
 use reqwest::Client;
+use ring::rand::SystemRandom;
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::clock::{Clock, SystemClock};
 use crate::crypto::b64_encode;
-use crate::push::{PushError, PushOutcome, PushSender};
+use crate::push::{
+    DEFAULT_PROVIDER_TIMEOUT_MS, InvalidTokenClass, PushError, PushOutcome, PushSender,
+    UpstreamErrorClass, classify_http_status,
+};
 use crate::store::{ApnsEnv, BoxFuture, Registration};
 
 /// Apple APNs production HTTP/2 endpoint.
@@ -31,13 +34,19 @@ pub const APNS_JWT_TTL_SECS: u64 = 45 * 60;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApnsPushMode {
-    /// Silent background wake push (`apns-push-type: background`, `apns-priority: 5`,
-    /// `{"aps":{"content-available":1}}`).
+    /// Content-free generic visible notification (`apns-push-type: alert`,
+    /// `apns-priority: 10`, `mutable-content: 1`) as required by Spec §9.
+    ///
+    /// Allows an iOS Notification Service Extension to peek and decrypt locally while
+    /// avoiding iOS silent-push throttling.
     #[default]
-    Background,
-    /// Content-free alert wake push (`apns-push-type: alert`, `apns-priority: 10`,
-    /// `mutable-content: 1`) for apps using an iOS Notification Service Extension.
     Alert,
+    /// Opt-in silent background wake push (`apns-push-type: background`,
+    /// `apns-priority: 5`, `{"aps":{"content-available":1}}`).
+    ///
+    /// Note: iOS aggressively throttles or drops silent background pushes under Low Power
+    /// Mode or background budget limits.
+    Background,
 }
 
 /// Configuration for [`ApnsSender`].
@@ -53,13 +62,13 @@ pub struct ApnsConfig {
     pub private_key_pem: Zeroizing<String>,
     /// Default APNs environment used when a registration omits `apns_env`.
     pub default_env: ApnsEnv,
-    /// Silent background wake (default) or alert wake mode.
+    /// Generic visible alert (default per Spec §9) or opt-in silent background wake mode.
     pub push_mode: ApnsPushMode,
     /// Production gateway base URL (overrideable for testing).
     pub production_url: String,
     /// Sandbox gateway base URL (overrideable for testing).
     pub sandbox_url: String,
-    /// Upstream HTTP request timeout.
+    /// Upstream HTTP request timeout (defaults to 3.5 s, strictly below Dispatch's 5 s timeout).
     pub timeout: Duration,
 }
 
@@ -80,25 +89,26 @@ impl fmt::Debug for ApnsConfig {
 }
 
 impl ApnsConfig {
-    /// Creates an [`ApnsConfig`] with default Apple gateway URLs and a 10-second timeout.
+    /// Creates an [`ApnsConfig`] with default Apple gateway URLs, visible alert mode
+    /// (Spec §9), and a 3.5-second timeout.
     #[must_use]
     pub fn new(
         team_id: String,
         key_id: String,
         bundle_id: String,
-        private_key_pem: String,
+        private_key_pem: Zeroizing<String>,
         default_env: ApnsEnv,
     ) -> Self {
         Self {
             team_id,
             key_id,
             bundle_id,
-            private_key_pem: Zeroizing::new(private_key_pem),
+            private_key_pem,
             default_env,
-            push_mode: ApnsPushMode::Background,
+            push_mode: ApnsPushMode::Alert,
             production_url: APNS_PRODUCTION_URL.to_owned(),
             sandbox_url: APNS_SANDBOX_URL.to_owned(),
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_millis(DEFAULT_PROVIDER_TIMEOUT_MS),
         }
     }
 }
@@ -128,7 +138,8 @@ struct ApnsErrorBody {
 /// APNs HTTP/2 wake push provider.
 pub struct ApnsSender {
     client: Client,
-    signing_key: SigningKey,
+    key_pair: EcdsaKeyPair,
+    rng: SystemRandom,
     team_id: String,
     key_id: String,
     bundle_id: String,
@@ -155,6 +166,8 @@ impl fmt::Debug for ApnsSender {
 impl ApnsSender {
     /// Constructs a new [`ApnsSender`] backed by the system clock.
     ///
+    /// Validates the `.p8` P-256 signing key immediately at startup.
+    ///
     /// # Errors
     ///
     /// Returns [`PushError::Config`] if configuration fields are empty, the `.p8` key
@@ -178,18 +191,24 @@ impl ApnsSender {
             ));
         }
 
-        let signing_key = SigningKey::from_pkcs8_pem(config.private_key_pem.as_str())
-            .map_err(|e| PushError::Config(format!("invalid APNs .p8 PKCS#8 PEM key: {e}")))?;
+        let rng = SystemRandom::new();
+        let key_pair = parse_p256_pkcs8_pem(config.private_key_pem.as_str(), &rng)?;
+
+        // Exercise signing at startup so key issues fail immediately rather than on first push.
+        key_pair.sign(&rng, b"apns-startup-check").map_err(|_| {
+            PushError::Config("APNs P-256 key failed ES256 startup check".to_owned())
+        })?;
 
         let client = Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| PushError::Config(format!("failed to build APNs HTTP client: {e}")))?;
+            .map_err(|_| PushError::Config("failed to build APNs HTTP client".to_owned()))?;
 
         Ok(Self {
             client,
-            signing_key,
+            key_pair,
+            rng,
             team_id: config.team_id,
             key_id: config.key_id,
             bundle_id: config.bundle_id,
@@ -230,33 +249,41 @@ impl ApnsSender {
             alg: "ES256",
             kid: &self.key_id,
         })
-        .map_err(|e| PushError::Auth(format!("failed to encode APNs JWT header: {e}")))?;
+        .map_err(|_| PushError::Auth {
+            class: UpstreamErrorClass::Auth,
+        })?;
         let claims_json = serde_json::to_vec(&JwtClaims {
             iss: &self.team_id,
             iat: iat_secs,
         })
-        .map_err(|e| PushError::Auth(format!("failed to encode APNs JWT claims: {e}")))?;
+        .map_err(|_| PushError::Auth {
+            class: UpstreamErrorClass::Auth,
+        })?;
 
         let signing_input = format!("{}.{}", b64_encode(&header_json), b64_encode(&claims_json));
-        let signature: Signature = self.signing_key.sign(signing_input.as_bytes());
-        let sig_bytes = signature.to_bytes();
+        let signature = self
+            .key_pair
+            .sign(&self.rng, signing_input.as_bytes())
+            .map_err(|_| PushError::Auth {
+                class: UpstreamErrorClass::Auth,
+            })?;
         Ok(Zeroizing::new(format!(
             "{signing_input}.{}",
-            b64_encode(sig_bytes.as_ref())
+            b64_encode(signature.as_ref())
         )))
     }
 
     fn wake_payload(&self) -> (&'static str, &'static str, &'static [u8]) {
         match self.push_mode {
+            ApnsPushMode::Alert => (
+                "alert",
+                "10",
+                br#"{"aps":{"mutable-content":1,"alert":{"title":"New notification","body":"Open the app to view."}}}"#,
+            ),
             ApnsPushMode::Background => (
                 "background",
                 "5",
                 br#"{"aps":{"content-available":1}}"#,
-            ),
-            ApnsPushMode::Alert => (
-                "alert",
-                "10",
-                br#"{"aps":{"mutable-content":1,"content-available":1,"alert":{"title":"New activity","body":"Open the app to check for updates."}}}"#,
             ),
         }
     }
@@ -269,12 +296,13 @@ impl ApnsSender {
         };
         let url = format!("{base_url}/3/device/{}", registration.device_token);
         let jwt = self.bearer_jwt()?;
+        let auth_header = Zeroizing::new(format!("bearer {}", jwt.as_str()));
         let (push_type, priority, body) = self.wake_payload();
 
         let response = self
             .client
             .post(&url)
-            .header("authorization", format!("bearer {}", jwt.as_str()))
+            .header("authorization", auth_header.as_str())
             .header("apns-topic", &self.bundle_id)
             .header("apns-push-type", push_type)
             .header("apns-priority", priority)
@@ -283,8 +311,13 @@ impl ApnsSender {
             .body(body)
             .send()
             .await
-            .map_err(|e| {
-                PushError::Upstream(format!("APNs request failed: {}", e.without_url()))
+            .map_err(|e| PushError::Upstream {
+                class: if e.is_timeout() {
+                    UpstreamErrorClass::Timeout
+                } else {
+                    UpstreamErrorClass::Transport
+                },
+                status: None,
             })?;
 
         let status = response.status();
@@ -292,28 +325,26 @@ impl ApnsSender {
             return Ok(ApnsResponse::Outcome(PushOutcome::Delivered));
         }
 
-        let error_reason = response
+        let status_code = status.as_u16();
+        let reason = response
             .bytes()
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ApnsErrorBody>(&bytes).ok())
-            .and_then(|body| body.reason)
-            .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+            .and_then(|body| body.reason);
 
-        if status.as_u16() == 403 && error_reason == "ExpiredProviderToken" {
+        if status_code == 403 && reason.as_deref() == Some("ExpiredProviderToken") {
             return Ok(ApnsResponse::ExpiredToken);
         }
 
-        if is_invalid_apns_token(status.as_u16(), &error_reason) {
-            return Ok(ApnsResponse::Outcome(PushOutcome::InvalidToken {
-                reason: error_reason,
-            }));
+        if let Some(class) = classify_invalid_apns_token(status_code, reason.as_deref()) {
+            return Ok(ApnsResponse::Outcome(PushOutcome::InvalidToken { class }));
         }
 
-        Err(PushError::Upstream(format!(
-            "APNs rejected push with status {} ({error_reason})",
-            status.as_u16()
-        )))
+        Err(PushError::Upstream {
+            class: classify_http_status(status_code),
+            status: Some(status_code),
+        })
     }
 }
 
@@ -322,15 +353,101 @@ enum ApnsResponse {
     ExpiredToken,
 }
 
-fn is_invalid_apns_token(status: u16, reason: &str) -> bool {
-    if status == 410 {
-        return true;
+/// Parses a PKCS#8 (`PRIVATE KEY`) PEM P-256 private key (Apple `.p8` format) into a
+/// [`ring::signature::EcdsaKeyPair`], zeroizing intermediate DER bytes on drop.
+fn parse_p256_pkcs8_pem(pem: &str, rng: &SystemRandom) -> Result<EcdsaKeyPair, PushError> {
+    const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
+    const END: &str = "-----END PRIVATE KEY-----";
+
+    let trimmed = pem.trim();
+    let (_, after_begin) = trimmed.split_once(BEGIN).ok_or_else(|| {
+        PushError::Config("APNs .p8 key must be PKCS#8 PRIVATE KEY PEM".to_owned())
+    })?;
+    let (body, _) = after_begin
+        .split_once(END)
+        .ok_or_else(|| PushError::Config("missing PEM END marker in APNs .p8 key".to_owned()))?;
+
+    let compact = Zeroizing::new(
+        body.chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect::<String>(),
+    );
+    let der = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .map_err(|_| PushError::Config("invalid base64 in APNs .p8 PEM key".to_owned()))?,
+    );
+
+    if let Ok(kp) = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &der, rng) {
+        return Ok(kp);
     }
-    status == 400
-        && matches!(
-            reason,
-            "BadDeviceToken" | "DeviceTokenNotForTopic" | "Unregistered"
+
+    // Apple Developer Portal `.p8` files often include a redundant `[0] namedCurve` tag
+    // inside the inner SEC1 ECPrivateKey (`MIGTAgEA...`), which `ring::from_pkcs8` rejects.
+    // Extract the 32-byte private scalar and 65-byte uncompressed public key from that layout.
+    if let Some((priv_key, pub_key)) = parse_apple_p8_pkcs8_with_named_curve(&der) {
+        return EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            priv_key,
+            pub_key,
+            rng,
         )
+        .map_err(|_| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()));
+    }
+
+    Err(PushError::Config(
+        "invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned(),
+    ))
+}
+
+/// Parses Apple's 138-byte PKCS#8 P-256 DER (`MIGTAgEA...`) carrying both `[0] namedCurve`
+/// and `[1] publicKey` inside the inner SEC1 `ECPrivateKey`.
+fn parse_apple_p8_pkcs8_with_named_curve(der: &[u8]) -> Option<(&[u8], &[u8])> {
+    // Prefix: SEQUENCE (147) { INTEGER 0, AlgorithmIdentifier(ecPublicKey, prime256v1),
+    // OCTET STRING (121) { SEQUENCE (119) { INTEGER 1, OCTET STRING (32) ... } } }
+    const PREFIX: &[u8] = &[
+        0x30, 0x81, 0x93, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+        0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x79, 0x30,
+        0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
+    ];
+    // Middle: [0] prime256v1 OID + [1] BIT STRING (65-byte uncompressed point)
+    const MIDDLE: &[u8] = &[
+        0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0xa1, 0x44, 0x03,
+        0x42, 0x00,
+    ];
+    let expected_len = PREFIX.len() + 32 + MIDDLE.len() + 65;
+    if der.len() != expected_len {
+        return None;
+    }
+    if !der.starts_with(PREFIX) {
+        return None;
+    }
+    let priv_start = PREFIX.len();
+    let mid_start = priv_start + 32;
+    let pub_start = mid_start + MIDDLE.len();
+    if der.get(mid_start..pub_start) != Some(MIDDLE) {
+        return None;
+    }
+    let priv_key = der.get(priv_start..mid_start)?;
+    let pub_key = der.get(pub_start..)?;
+    if pub_key.first() != Some(&0x04) {
+        return None;
+    }
+    Some((priv_key, pub_key))
+}
+
+/// Requires explicit token-specific APNs evidence before deleting a handle:
+/// - `410 Gone` with JSON `reason == "Unregistered"`
+/// - `400 Bad Request` with JSON `reason == "BadDeviceToken"`
+///
+/// Every other response (including `410` without `Unregistered` and `400 DeviceTokenNotForTopic`,
+/// which can reflect server topic misconfiguration) preserves the registration.
+fn classify_invalid_apns_token(status: u16, reason: Option<&str>) -> Option<InvalidTokenClass> {
+    match (status, reason) {
+        (410, Some("Unregistered")) => Some(InvalidTokenClass::ApnsUnregistered),
+        (400, Some("BadDeviceToken")) => Some(InvalidTokenClass::ApnsBadDeviceToken),
+        _ => None,
+    }
 }
 
 impl PushSender for ApnsSender {
@@ -345,9 +462,9 @@ impl PushSender for ApnsSender {
                     self.invalidate_jwt();
                     match self.send_once(registration).await? {
                         ApnsResponse::Outcome(outcome) => Ok(outcome),
-                        ApnsResponse::ExpiredToken => Err(PushError::Auth(
-                            "APNs rejected refreshed provider JWT".to_owned(),
-                        )),
+                        ApnsResponse::ExpiredToken => Err(PushError::Auth {
+                            class: UpstreamErrorClass::Auth,
+                        }),
                     }
                 }
             }
@@ -360,16 +477,99 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apns_config_debug_redacts_private_key() {
+    fn apns_config_defaults_to_alert_and_redacts_private_key() {
         let cfg = ApnsConfig::new(
             "TEAM123456".to_owned(),
             "KEY1234567".to_owned(),
             "com.example.app".to_owned(),
-            "-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n-----END PRIVATE KEY-----".to_owned(),
+            Zeroizing::new(
+                "-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n-----END PRIVATE KEY-----".to_owned(),
+            ),
             ApnsEnv::Production,
+        );
+        assert_eq!(cfg.push_mode, ApnsPushMode::Alert);
+        assert_eq!(
+            cfg.timeout,
+            Duration::from_millis(DEFAULT_PROVIDER_TIMEOUT_MS)
         );
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("SUPERSECRET"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn classifies_only_token_specific_apns_errors_as_invalid() {
+        assert_eq!(
+            classify_invalid_apns_token(410, Some("Unregistered")),
+            Some(InvalidTokenClass::ApnsUnregistered)
+        );
+        assert_eq!(
+            classify_invalid_apns_token(400, Some("BadDeviceToken")),
+            Some(InvalidTokenClass::ApnsBadDeviceToken)
+        );
+
+        // Ambiguous or configuration-related errors must NOT prune handles.
+        for (status, reason) in [
+            (410, None),
+            (410, Some("Other")),
+            (400, Some("DeviceTokenNotForTopic")),
+            (400, Some("BadTopic")),
+            (400, None),
+            (403, Some("InvalidProviderToken")),
+            (429, Some("TooManyRequests")),
+            (500, Some("InternalServerError")),
+            (503, Some("ServiceUnavailable")),
+        ] {
+            assert_eq!(
+                classify_invalid_apns_token(status, reason),
+                None,
+                "expected non-pruning for ({status}, {reason:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_both_openssl_and_apple_p8_pkcs8_layouts() {
+        let rng = SystemRandom::new();
+        // OpenSSL 3 PKCS#8 P-256 layout (`MIGHAgEA...`, without inner `[0] namedCurve`).
+        let openssl_pem = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqqAO++8h+XsXLStn
+Gp0X0DGtKQytjLTKJkmEHtPgH82hRANCAATDU5zOZ/4OQlLrWs54n25PpWLNjV8R
+JuPZpk8VOSsbnrqvn8wbb67SMGiIvO0fc+LfUdrStgDJKPZM4+epIvG/
+-----END PRIVATE KEY-----";
+        let kp1 = parse_p256_pkcs8_pem(openssl_pem, &rng).unwrap();
+
+        // Apple Developer Portal `.p8` PKCS#8 layout (`MIGTAgEA...`, with inner `[0] namedCurve`).
+        let openssl_der = base64::engine::general_purpose::STANDARD
+            .decode(
+                openssl_pem
+                    .lines()
+                    .filter(|l| !l.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        let priv_key = &openssl_der[36..68];
+        let pub_key = &openssl_der[73..138];
+        let mut apple_der = Vec::new();
+        apple_der.extend_from_slice(&[
+            0x30, 0x81, 0x93, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+            0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04,
+            0x79, 0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
+        ]);
+        apple_der.extend_from_slice(priv_key);
+        apple_der.extend_from_slice(&[
+            0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0xa1, 0x44,
+            0x03, 0x42, 0x00,
+        ]);
+        apple_der.extend_from_slice(pub_key);
+        let apple_b64 = base64::engine::general_purpose::STANDARD.encode(&apple_der);
+        assert!(apple_b64.starts_with("MIGTAgEA"));
+        let apple_pem =
+            format!("-----BEGIN PRIVATE KEY-----\n{apple_b64}\n-----END PRIVATE KEY-----");
+        let kp2 = parse_p256_pkcs8_pem(&apple_pem, &rng).unwrap();
+
+        use ring::signature::KeyPair as _;
+        assert_eq!(kp1.public_key().as_ref(), kp2.public_key().as_ref());
     }
 }

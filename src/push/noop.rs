@@ -1,10 +1,12 @@
 //! No-op and recording mock [`PushSender`] implementations for local dev and tests.
 
 use std::collections::VecDeque;
+use std::fmt;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::push::{PushError, PushOutcome, PushSender};
+use crate::push::{PushError, PushOutcome, PushSender, UpstreamErrorClass};
 use crate::store::{ApnsEnv, BoxFuture, Platform, Registration};
 
 /// No-op push sender for local development without Apple/Google credentials.
@@ -28,7 +30,9 @@ impl PushSender for NoopSender {
 }
 
 /// Captured wake push dispatch recorded by [`RecordingSender`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Sensitive fields (`handle`, `device_token`) are redacted in [`fmt::Debug`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecordedPush {
     /// Handle that triggered the push.
     pub handle: String,
@@ -40,15 +44,32 @@ pub struct RecordedPush {
     pub apns_env: Option<ApnsEnv>,
 }
 
+impl fmt::Debug for RecordedPush {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordedPush")
+            .field("handle", &"<redacted>")
+            .field("platform", &self.platform)
+            .field("device_token", &"<redacted>")
+            .field("apns_env", &self.apns_env)
+            .finish()
+    }
+}
+
+enum ScriptedResponse {
+    Outcome(PushOutcome),
+    Upstream(UpstreamErrorClass),
+    Delayed(Duration, PushOutcome),
+}
+
 /// Scriptable mock [`PushSender`] for tests.
 #[derive(Default)]
 pub struct RecordingSender {
     recorded: Mutex<Vec<RecordedPush>>,
-    scripted: Mutex<VecDeque<Result<PushOutcome, String>>>,
+    scripted: Mutex<VecDeque<ScriptedResponse>>,
 }
 
-impl std::fmt::Debug for RecordingSender {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for RecordingSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecordingSender")
             .field("recorded_count", &self.recorded.lock().len())
             .finish()
@@ -64,12 +85,23 @@ impl RecordingSender {
 
     /// Enqueues an explicit [`PushOutcome`] for the next `send_wake` call.
     pub fn enqueue_outcome(&self, outcome: PushOutcome) {
-        self.scripted.lock().push_back(Ok(outcome));
+        self.scripted
+            .lock()
+            .push_back(ScriptedResponse::Outcome(outcome));
     }
 
-    /// Enqueues an upstream error for the next `send_wake` call.
-    pub fn enqueue_upstream_error(&self, message: impl Into<String>) {
-        self.scripted.lock().push_back(Err(message.into()));
+    /// Enqueues an upstream error class for the next `send_wake` call.
+    pub fn enqueue_upstream_error(&self, class: UpstreamErrorClass) {
+        self.scripted
+            .lock()
+            .push_back(ScriptedResponse::Upstream(class));
+    }
+
+    /// Enqueues a delayed response for testing provider timeout bounding.
+    pub fn enqueue_delayed_outcome(&self, delay: Duration, outcome: PushOutcome) {
+        self.scripted
+            .lock()
+            .push_back(ScriptedResponse::Delayed(delay, outcome));
     }
 
     /// Returns a snapshot of all recorded wake dispatches.
@@ -91,11 +123,38 @@ impl PushSender for RecordingSender {
                 device_token: registration.device_token.clone(),
                 apns_env: registration.apns_env,
             });
-            match self.scripted.lock().pop_front() {
-                Some(Ok(outcome)) => Ok(outcome),
-                Some(Err(msg)) => Err(PushError::Upstream(msg)),
+            let next = self.scripted.lock().pop_front();
+            match next {
+                Some(ScriptedResponse::Outcome(outcome)) => Ok(outcome),
+                Some(ScriptedResponse::Upstream(class)) => Err(PushError::Upstream {
+                    class,
+                    status: None,
+                }),
+                Some(ScriptedResponse::Delayed(delay, outcome)) => {
+                    tokio::time::sleep(delay).await;
+                    Ok(outcome)
+                }
                 None => Ok(PushOutcome::Delivered),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_push_debug_redacts_handle_and_device_token() {
+        let recorded = RecordedPush {
+            handle: "secret-handle-xyz".to_owned(),
+            platform: Platform::Fcm,
+            device_token: "secret-fcm-device-token-999".to_owned(),
+            apns_env: None,
+        };
+        let shown = format!("{recorded:?}");
+        assert!(!shown.contains("secret-handle-xyz"));
+        assert!(!shown.contains("secret-fcm-device-token-999"));
+        assert!(shown.contains("<redacted>"));
     }
 }

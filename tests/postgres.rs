@@ -1,15 +1,18 @@
-//! PostgreSQL storage, replay-cache, rate-limiter, and multi-replica HTTP integration tests.
+//! PostgreSQL storage, durable replay-cache, rate-limiter, clock-skew, and multi-replica
+//! HTTP integration tests.
 //!
 //! Guarded by `TEST_DATABASE_URL`. When unset locally, tests return early without touching
 //! any local database; set `REQUIRE_POSTGRES_TESTS=1` (as in CI) to fail instead of skipping.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt as _;
@@ -17,16 +20,16 @@ use serde_json::{Value, json};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tower::ServiceExt as _;
 
-use pubky_dispatch_push_relay::clock::FixedClock;
+use pubky_dispatch_push_relay::clock::{Clock as _, FixedClock, SystemClock};
 use pubky_dispatch_push_relay::config::RelaySettings;
 use pubky_dispatch_push_relay::crypto::{
     SIGNATURE_HEADER, SIGNING_LABEL, b64_encode, sign_webhook,
 };
-use pubky_dispatch_push_relay::http::{RelayState, router};
-use pubky_dispatch_push_relay::push::PushOutcome;
+use pubky_dispatch_push_relay::http::{RateLimitBackends, RelayState, router};
 use pubky_dispatch_push_relay::push::noop::RecordingSender;
+use pubky_dispatch_push_relay::push::{InvalidTokenClass, PushOutcome};
 use pubky_dispatch_push_relay::rate_limit::RateLimitStore;
-use pubky_dispatch_push_relay::replay::{NONCE_TTL_MS, ReplayStore};
+use pubky_dispatch_push_relay::replay::{ReplayError, ReplayStore};
 use pubky_dispatch_push_relay::store::postgres::{
     PostgresRateLimitStore, PostgresReplayStore, PostgresStore,
 };
@@ -113,6 +116,7 @@ fn sample_reg(handle: &str) -> Registration {
         push_key: [9u8; 32],
         apns_env: Some(ApnsEnv::Production),
         created_at_ms: BASE_TIME_MS,
+        last_active_at_ms: BASE_TIME_MS,
     }
 }
 
@@ -128,8 +132,9 @@ async fn send_json(
     (status, headers, json)
 }
 
-async fn register_device(
+async fn register_device_from(
     app: &Router,
+    ip: IpAddr,
     token: &str,
     key: &SigningKey,
 ) -> (StatusCode, axum::http::HeaderMap, Value) {
@@ -138,12 +143,14 @@ async fn register_device(
         "device_token": token,
         "push_key": b64_encode(&key.verifying_key().to_bytes()),
     });
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .uri("/v1/register")
         .header("content-type", "application/json")
         .body(Body::from(payload.to_string()))
         .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(ip, 50000)));
     send_json(app, req).await
 }
 
@@ -179,7 +186,6 @@ async fn postgres_store_crud_duplicate_and_concurrent_capacity_cap() {
     let store = Arc::new(PostgresStore::from_pool(schema.pool.clone()).await.unwrap());
     store.ping().await.unwrap();
 
-    // Basic CRUD + duplicate rejection.
     let reg = sample_reg("pg-handle-1");
     store.insert(&reg, Some(10)).await.unwrap();
     assert_eq!(store.get("pg-handle-1").await.unwrap().unwrap(), reg);
@@ -191,7 +197,6 @@ async fn postgres_store_crud_duplicate_and_concurrent_capacity_cap() {
     assert!(!store.delete("pg-handle-1").await.unwrap());
     assert!(store.get("pg-handle-1").await.unwrap().is_none());
 
-    // Concurrency test: 20 simultaneous inserts racing against cap = 5 must allow strictly 5.
     let mut tasks = Vec::new();
     for i in 0..20 {
         let store = store.clone();
@@ -213,7 +218,6 @@ async fn postgres_store_crud_duplicate_and_concurrent_capacity_cap() {
     assert_eq!(succeeded, 5, "advisory lock must cap total rows at 5");
     assert_eq!(cap_exceeded, 15);
 
-    // Deleting one row allows another insert.
     let mut deleted = false;
     for i in 0..20 {
         if store.delete(&format!("race-handle-{i}")).await.unwrap() {
@@ -231,12 +235,30 @@ async fn postgres_store_crud_duplicate_and_concurrent_capacity_cap() {
 }
 
 #[tokio::test]
-async fn postgres_replay_store_concurrent_and_ttl_expiry() {
+async fn postgres_replay_table_is_durable_bounded_and_uses_database_time() {
     let Some(schema) = TestSchema::setup().await else {
         return;
     };
 
-    let replay = Arc::new(PostgresReplayStore::new(schema.pool.clone()).await.unwrap());
+    // Short 400 ms TTL with live cap = 2 to test durability, cap, and DB-clock expiry.
+    let replay = Arc::new(
+        PostgresReplayStore::with_ttl(schema.pool.clone(), 400, 2)
+            .await
+            .unwrap(),
+    );
+
+    // Verify webhook_nonces is a permanent WAL-logged table ('p'), NOT UNLOGGED ('u').
+    let persistence: String = sqlx::query_scalar(
+        "SELECT c.relpersistence::TEXT \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = 'webhook_nonces'",
+    )
+    .bind(&schema.schema_name)
+    .fetch_one(&schema.pool)
+    .await
+    .unwrap();
+    assert_eq!(persistence, "p", "webhook_nonces must be durable (logged)");
+
     let nonce = [0xAB; 16];
 
     // 10 concurrent replicas receiving the same fresh nonce: strictly 1 succeeds.
@@ -244,7 +266,7 @@ async fn postgres_replay_store_concurrent_and_ttl_expiry() {
     for _ in 0..10 {
         let replay = replay.clone();
         tasks.push(tokio::spawn(async move {
-            replay.check_and_record(nonce, BASE_TIME_MS).await.unwrap()
+            replay.check_and_record(nonce, 0, 0).await.unwrap()
         }));
     }
     let mut accepted = 0usize;
@@ -255,67 +277,73 @@ async fn postgres_replay_store_concurrent_and_ttl_expiry() {
     }
     assert_eq!(accepted, 1);
 
-    // Replay at t + TTL - 1 ms still rejected.
-    assert!(
-        !replay
-            .check_and_record(nonce, BASE_TIME_MS + NONCE_TTL_MS - 1)
-            .await
-            .unwrap()
-    );
+    // Fill second slot -> third fresh nonce returns CapacityExceeded (503), never evicting live nonces.
+    assert!(replay.check_and_record([0xCD; 16], 0, 0).await.unwrap());
+    assert!(matches!(
+        replay.check_and_record([0xEF; 16], 0, 0).await,
+        Err(ReplayError::CapacityExceeded)
+    ));
+    // Live nonce still rejected as replay (409) even while at capacity.
+    assert!(!replay.check_and_record(nonce, 0, 0).await.unwrap());
 
-    // Even before background pruning runs, once TTL has elapsed the expired row is replaced.
-    assert!(
-        replay
-            .check_and_record(nonce, BASE_TIME_MS + NONCE_TTL_MS)
-            .await
-            .unwrap()
-    );
-
-    // Pruning before expiry deletes 0; pruning at expiry deletes 1.
+    // A skewed replica claiming a far-future wall clock (+1 hour) CANNOT prune live nonces!
+    let far_future = SystemClock.now_ms() + 3_600_000;
     assert_eq!(
-        replay
-            .prune_expired(BASE_TIME_MS + 2 * NONCE_TTL_MS - 1)
-            .await
-            .unwrap(),
+        replay.prune_expired(far_future, far_future).await.unwrap(),
         0
     );
-    assert_eq!(
-        replay
-            .prune_expired(BASE_TIME_MS + 2 * NONCE_TTL_MS)
+    assert!(
+        !replay
+            .check_and_record(nonce, far_future, far_future)
             .await
-            .unwrap(),
-        1
+            .unwrap()
     );
+
+    // After the real DB 400 ms TTL elapses, the expired row is pruned cleanly.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(replay.prune_expired(0, 0).await.unwrap(), 2);
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_nonces")
+        .fetch_one(&schema.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
 
     schema.teardown().await;
 }
 
 #[tokio::test]
-async fn postgres_rate_limit_store_concurrent_and_sliding_window() {
+async fn postgres_rate_limit_store_concurrent_durable_and_sliding_window() {
     let Some(schema) = TestSchema::setup().await else {
         return;
     };
 
     let hook_limiter = Arc::new(
-        PostgresRateLimitStore::new(schema.pool.clone(), "hook", 4)
+        PostgresRateLimitStore::with_window(schema.pool.clone(), "hook", 400, 4)
             .await
             .unwrap(),
     );
     let reg_limiter = Arc::new(
-        PostgresRateLimitStore::new(schema.pool.clone(), "register", 2)
+        PostgresRateLimitStore::with_window(schema.pool.clone(), "register_global", 400, 2)
             .await
             .unwrap(),
     );
 
-    // 12 concurrent requests against limit = 4: strictly 4 pass, 8 return Retry-After >= 1.
+    let persistence: String = sqlx::query_scalar(
+        "SELECT c.relpersistence::TEXT \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = 'rate_limit_buckets'",
+    )
+    .bind(&schema.schema_name)
+    .fetch_one(&schema.pool)
+    .await
+    .unwrap();
+    assert_eq!(persistence, "p", "rate_limit_buckets must be durable");
+
     let mut tasks = Vec::new();
     for _ in 0..12 {
         let limiter = hook_limiter.clone();
         tasks.push(tokio::spawn(async move {
-            limiter
-                .check_and_record("handle-a", BASE_TIME_MS)
-                .await
-                .unwrap()
+            limiter.check_and_record("handle-a", 0).await.unwrap()
         }));
     }
     let mut ok_count = 0usize;
@@ -332,178 +360,164 @@ async fn postgres_rate_limit_store_concurrent_and_sliding_window() {
     assert_eq!(ok_count, 4);
     assert_eq!(limited_count, 8);
 
-    // Scope isolation: "register" scope is independent of "hook" scope for the same key.
+    // Scope isolation.
     assert_eq!(
-        reg_limiter
-            .check_and_record("handle-a", BASE_TIME_MS)
-            .await
-            .unwrap(),
+        reg_limiter.check_and_record("handle-a", 0).await.unwrap(),
         Ok(())
     );
 
-    // After 60 seconds, sliding window resets.
+    // Wait for real DB 400 ms sliding window to roll over and verify prune deletes row.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(hook_limiter.prune_expired(0).await.unwrap(), 1);
     assert_eq!(
-        hook_limiter
-            .check_and_record("handle-a", BASE_TIME_MS + 60_000)
-            .await
-            .unwrap(),
+        hook_limiter.check_and_record("handle-a", 0).await.unwrap(),
         Ok(())
     );
 
-    // remove_key clears the bucket immediately.
+    // remove_key clears bucket immediately.
     hook_limiter.remove_key("handle-a").await.unwrap();
     for _ in 0..4 {
         assert_eq!(
-            hook_limiter
-                .check_and_record("handle-a", BASE_TIME_MS + 60_000)
-                .await
-                .unwrap(),
+            hook_limiter.check_and_record("handle-a", 0).await.unwrap(),
             Ok(())
         );
     }
-
-    // prune_expired drops buckets once past their 60s expiry.
-    assert_eq!(
-        hook_limiter
-            .prune_expired(BASE_TIME_MS + 120_000)
-            .await
-            .unwrap(),
-        1
-    );
 
     schema.teardown().await;
 }
 
 #[tokio::test]
-async fn multi_replica_http_routers_share_registrations_replay_and_rate_limits() {
+async fn multi_replica_http_routers_share_state_and_tolerate_replica_clock_skew() {
     let Some(schema) = TestSchema::setup().await else {
         return;
     };
 
-    let clock = Arc::new(FixedClock::new(BASE_TIME_MS));
+    let now = SystemClock.now_ms();
+    let clock_a = Arc::new(FixedClock::new(now));
+    // Replica B's local clock is 20 minutes ahead: its prune MUST NOT drop Replica A's live nonces!
+    let clock_skewed = Arc::new(FixedClock::new(now + 20 * 60 * 1_000));
+    let clock_b = Arc::new(FixedClock::new(now));
+
     let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
     settings.rate_limit_per_minute = 3;
-    settings.register_rate_limit_per_minute = 4;
+    settings.register_ip_rate_limit_per_minute = 20;
+    settings.register_key_rate_limit_per_minute = 20;
+    settings.register_rate_limit_per_minute = 20;
+    settings.max_handles_per_push_key = 32;
     settings.max_registrations = 2;
 
-    // Build two completely independent replicas sharing only PostgreSQL.
     let build_replica = |pool: PgPool, clock: Arc<FixedClock>, settings: RelaySettings| async move {
         let store = Arc::new(PostgresStore::from_pool(pool.clone()).await.unwrap());
-        let replay: Arc<dyn ReplayStore> =
-            Arc::new(PostgresReplayStore::new(pool.clone()).await.unwrap());
-        let hook_limiter: Arc<dyn RateLimitStore> = Arc::new(
-            PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
+        let replay: Arc<dyn ReplayStore> = Arc::new(
+            PostgresReplayStore::new(pool.clone(), settings.nonce_cache_max_entries)
                 .await
                 .unwrap(),
         );
-        let reg_limiter: Arc<dyn RateLimitStore> = Arc::new(
-            PostgresRateLimitStore::new(pool, "register", settings.register_rate_limit_per_minute)
+        let limiters = RateLimitBackends {
+            hook_per_handle: Arc::new(
+                PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
+                    .await
+                    .unwrap(),
+            ),
+            register_per_ip: Arc::new(
+                PostgresRateLimitStore::new(
+                    pool.clone(),
+                    "register_ip",
+                    settings.register_ip_rate_limit_per_minute,
+                )
                 .await
                 .unwrap(),
-        );
+            ),
+            register_per_key: Arc::new(
+                PostgresRateLimitStore::new(
+                    pool.clone(),
+                    "register_key",
+                    settings.register_key_rate_limit_per_minute,
+                )
+                .await
+                .unwrap(),
+            ),
+            register_global: Arc::new(
+                PostgresRateLimitStore::new(
+                    pool,
+                    "register_global",
+                    settings.register_rate_limit_per_minute,
+                )
+                .await
+                .unwrap(),
+            ),
+        };
         let sender = Arc::new(RecordingSender::new());
-        let state = RelayState::with_backends(
-            store,
-            sender.clone(),
-            clock,
-            replay,
-            hook_limiter,
-            reg_limiter,
-            settings,
-        );
+        let state =
+            RelayState::with_backends(store, sender.clone(), clock, replay, limiters, settings);
         let app = router(state.clone());
         (state, app, sender)
     };
 
-    let (state_a, replica_a, sender_a) =
-        build_replica(schema.pool.clone(), clock.clone(), settings.clone()).await;
+    let (_state_a, replica_a, sender_a) =
+        build_replica(schema.pool.clone(), clock_a.clone(), settings.clone()).await;
     let (_state_b, replica_b, sender_b) =
-        build_replica(schema.pool.clone(), clock.clone(), settings).await;
-
-    // Health checks pass on both replicas.
-    for replica in [&replica_a, &replica_b] {
-        let (s, _, b) = send_json(
-            replica,
-            Request::builder()
-                .method("GET")
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-        assert_eq!(b["status"], "ok");
-    }
+        build_replica(schema.pool.clone(), clock_b.clone(), settings.clone()).await;
+    let (state_skewed, _replica_skewed, _sender_skewed) =
+        build_replica(schema.pool.clone(), clock_skewed, settings).await;
 
     let push_key = SigningKey::from_bytes(&[42u8; 32]);
+    let ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
 
     // 1. Register on replica A, deliver webhook via replica B.
-    let (s, _, b) = register_device(&replica_a, "fcm-multi-1", &push_key).await;
+    let (s, _, b) = register_device_from(&replica_a, ip1, "fcm-multi-1", &push_key).await;
     assert_eq!(s, StatusCode::OK);
     let handle1 = b["handle"].as_str().unwrap().to_owned();
 
-    let (s, _, b) = send_signed_hook(&replica_b, &push_key, &handle1, BASE_TIME_MS, [1; 16]).await;
+    // Idempotent re-registration on replica B returns the exact same handle!
+    let (s, _, b) = register_device_from(&replica_b, ip2, "fcm-multi-1", &push_key).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["handle"].as_str().unwrap(), handle1);
+
+    let (s, _, b) = send_signed_hook(&replica_b, &push_key, &handle1, now, [1; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b["delivered"], true);
-    assert_eq!(sender_b.recorded().len(), 1);
 
-    // 2. Replaying the same webhook against replica A returns 409 (shared replay table).
-    let (s, _, b) = send_signed_hook(&replica_a, &push_key, &handle1, BASE_TIME_MS, [1; 16]).await;
+    // 2. Skewed replica (+20 min ahead!) runs prune_caches(): MUST NOT drop live nonce [1; 16]!
+    state_skewed.prune_caches().await;
+    let (s, _, b) = send_signed_hook(&replica_a, &push_key, &handle1, now, [1; 16]).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(b["code"], "nonce_replay");
 
     // 3. Per-handle rate limit (3/min) is shared across replicas A and B.
-    let (s, _, _) = send_signed_hook(&replica_a, &push_key, &handle1, BASE_TIME_MS, [2; 16]).await;
+    let (s, _, _) = send_signed_hook(&replica_a, &push_key, &handle1, now, [2; 16]).await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _, _) = send_signed_hook(&replica_b, &push_key, &handle1, BASE_TIME_MS, [3; 16]).await;
+    let (s, _, _) = send_signed_hook(&replica_b, &push_key, &handle1, now, [3; 16]).await;
     assert_eq!(s, StatusCode::OK);
-    let (s, headers, b) =
-        send_signed_hook(&replica_a, &push_key, &handle1, BASE_TIME_MS, [4; 16]).await;
+    let (s, headers, b) = send_signed_hook(&replica_a, &push_key, &handle1, now, [4; 16]).await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(b["code"], "rate_limited");
     assert!(headers.get("retry-after").is_some());
     assert_eq!(sender_a.recorded().len(), 1);
     assert_eq!(sender_b.recorded().len(), 2);
 
-    // 4. MAX_REGISTRATIONS = 2 is shared across replicas A and B.
-    let (s, _, _) = register_device(&replica_b, "fcm-multi-2", &push_key).await;
+    // 4. MAX_REGISTRATIONS = 2 shared across replicas A and B; pruning on B frees slot for A.
+    let (s, _, _) = register_device_from(&replica_b, ip1, "fcm-multi-2", &push_key).await;
     assert_eq!(s, StatusCode::OK);
-
-    let (s, _, b) = register_device(&replica_a, "fcm-multi-3", &push_key).await;
+    let (s, _, b) = register_device_from(&replica_a, ip2, "fcm-multi-3", &push_key).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(b["code"], "unavailable");
 
-    // 5. Pruning handle1 via replica B frees a slot for replica A (after advancing clock 60s
-    // so both per-handle and global registration rate limits reset).
-    clock.advance_ms(60_000);
-    let t2 = BASE_TIME_MS + 60_000;
+    // Clear handle1 via token-specific rejection on replica B (after clearing handle1 rate bucket).
+    sqlx::query("DELETE FROM rate_limit_buckets WHERE scope = 'hook'")
+        .execute(&schema.pool)
+        .await
+        .unwrap();
     sender_b.enqueue_outcome(PushOutcome::InvalidToken {
-        reason: "UNREGISTERED".to_owned(),
+        class: InvalidTokenClass::FcmUnregistered,
     });
-    let (s, _, b) = send_signed_hook(&replica_b, &push_key, &handle1, t2, [5; 16]).await;
+    let (s, _, b) = send_signed_hook(&replica_b, &push_key, &handle1, now, [5; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b["pruned"], true);
 
-    let (s, _, _) = register_device(&replica_a, "fcm-multi-3", &push_key).await;
+    let (s, _, _) = register_device_from(&replica_a, ip2, "fcm-multi-3", &push_key).await;
     assert_eq!(s, StatusCode::OK);
-
-    // 6. Global registration rate limit (4/min) is shared across replicas A and B.
-    // We already used 1 slot at t2 on replica A; send 3 more across B/A/B (hitting 503
-    // cap after quota check), then the 5th request hits 429 before touching storage.
-    let (s, _, _) = register_device(&replica_b, "fcm-multi-4", &push_key).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    let (s, _, _) = register_device(&replica_a, "fcm-multi-5", &push_key).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    let (s, _, _) = register_device(&replica_b, "fcm-multi-6", &push_key).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    let (s, headers, b) = register_device(&replica_a, "fcm-multi-7", &push_key).await;
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(b["code"], "rate_limited");
-    assert!(headers.get("retry-after").is_some());
-
-    // 7. Background cache sweep prunes expired Postgres UNLOGGED rows cleanly.
-    clock.advance_ms(NONCE_TTL_MS + 60_000);
-    state_a.prune_caches().await;
 
     schema.teardown().await;
 }

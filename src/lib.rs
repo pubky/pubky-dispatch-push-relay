@@ -7,11 +7,12 @@
 //! - The Pubky Dispatch server invokes `POST /v1/hook` with only the handle, timestamp,
 //!   nonce, and an Ed25519 signature over `lp(label, relay_origin, raw_body)`.
 //! - After enforcing all six Wire Format §8.3 verification rules, the relay dispatches a
-//!   content-free wake push to APNs or FCM and automatically deletes handles whose device
-//!   tokens are reported as invalid or unregistered.
+//!   content-free wake push to APNs or FCM and deletes handles only on token-specific
+//!   provider rejections.
 
 #![forbid(unsafe_code)]
 
+pub mod client_ip;
 pub mod clock;
 pub mod config;
 pub mod crypto;
@@ -26,4 +27,4 @@ pub mod time;
 
 pub use config::{ProtocolConfig, RelaySettings};
 pub use crypto::{SIGNATURE_HEADER, SIGNING_LABEL};
-pub use http::{RelayState, router};
+pub use http::{RateLimitBackends, RelayState, router};

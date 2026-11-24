@@ -1,25 +1,32 @@
 //! Axum HTTP router and handlers for `POST /v1/register`, `POST /v1/hook`, and `GET /health`.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
+use crate::client_ip::ip_rate_limit_key;
 use crate::clock::Clock;
 use crate::config::RelaySettings;
 use crate::crypto::{
-    b64_decode_array, generate_handle, validate_public_key, verify_webhook_signature,
+    b64_decode_array, b64_encode, generate_handle, validate_public_key, verify_webhook_signature,
 };
 use crate::error::ApiError;
 use crate::json::{check_strict_json, parse_strict_json};
 use crate::push::{PushError, PushOutcome, PushSender};
 use crate::rate_limit::{RateLimitStore, RateLimiter};
-use crate::replay::{NONCE_TTL_MS, NonceCache, ReplayStore};
-use crate::store::{ApnsEnv, Platform, Registration, RegistrationStore, StoreError};
+use crate::replay::{NONCE_TTL_MS, NonceCache, ReplayError, ReplayStore};
+use crate::store::{
+    ApnsEnv, Platform, RegisterOutcome, Registration, RegistrationStore, StoreError,
+};
 use crate::time::parse_rfc3339;
 
 /// Allowed clock skew for webhook timestamps: ±5 minutes (Wire Format §8.3 rule 4).
@@ -39,7 +46,10 @@ pub struct RelayState {
     clock: Arc<dyn Clock>,
     replay: Arc<dyn ReplayStore>,
     rate_limiter: Arc<dyn RateLimitStore>,
-    register_rate_limiter: Arc<dyn RateLimitStore>,
+    register_ip_limiter: Arc<dyn RateLimitStore>,
+    register_key_limiter: Arc<dyn RateLimitStore>,
+    register_global_limiter: Arc<dyn RateLimitStore>,
+    concurrency: Arc<Semaphore>,
     settings: Arc<RelaySettings>,
 }
 
@@ -51,9 +61,24 @@ impl std::fmt::Debug for RelayState {
     }
 }
 
+/// Bundle of rate-limit stores injected into [`RelayState::with_backends`].
+pub struct RateLimitBackends {
+    /// Per-handle webhook push rate limiter (Wire Format §8.3 rule 6).
+    pub hook_per_handle: Arc<dyn RateLimitStore>,
+    /// Per-client-IP registration rate limiter.
+    pub register_per_ip: Arc<dyn RateLimitStore>,
+    /// Per-push-key registration rate limiter.
+    pub register_per_key: Arc<dyn RateLimitStore>,
+    /// Global registration rate limiter.
+    pub register_global: Arc<dyn RateLimitStore>,
+}
+
 impl RelayState {
     /// Creates a new [`RelayState`] using in-memory replay cache and rate limiters
-    /// (suitable for single-instance SQLite deployments and tests).
+    /// (for unit tests and direct embedding).
+    ///
+    /// For durable SQLite deployments, construct a [`crate::store::sqlite::SqliteReplayStore`]
+    /// and pass it via [`Self::with_backends`].
     #[must_use]
     pub fn new(
         store: Arc<dyn RegistrationStore>,
@@ -65,71 +90,98 @@ impl RelayState {
             NONCE_TTL_MS,
             settings.nonce_cache_max_entries,
         ));
-        let rate_limiter: Arc<dyn RateLimitStore> = Arc::new(RateLimiter::new(
-            settings.rate_limit_per_minute,
-            settings.rate_limit_max_handles,
-        ));
-        let register_rate_limiter: Arc<dyn RateLimitStore> =
-            Arc::new(RateLimiter::new(settings.register_rate_limit_per_minute, 1));
-        Self::with_backends(
-            store,
-            push,
-            clock,
-            replay,
-            rate_limiter,
-            register_rate_limiter,
-            settings,
-        )
+        let limiters = Self::in_memory_limiters(&settings);
+        Self::with_backends(store, push, clock, replay, limiters, settings)
     }
 
-    /// Creates a new [`RelayState`] with custom [`ReplayStore`] and [`RateLimitStore`]
-    /// implementations (for example PostgreSQL backends in multi-replica deployments).
+    /// Creates in-memory sliding-window [`RateLimitBackends`] sized from `settings`.
+    #[must_use]
+    pub fn in_memory_limiters(settings: &RelaySettings) -> RateLimitBackends {
+        RateLimitBackends {
+            hook_per_handle: Arc::new(RateLimiter::new(
+                settings.rate_limit_per_minute,
+                settings.rate_limit_max_handles,
+            )),
+            register_per_ip: Arc::new(RateLimiter::new(
+                settings.register_ip_rate_limit_per_minute,
+                settings.rate_limit_max_handles,
+            )),
+            register_per_key: Arc::new(RateLimiter::new(
+                settings.register_key_rate_limit_per_minute,
+                settings.rate_limit_max_handles,
+            )),
+            register_global: Arc::new(RateLimiter::new(settings.register_rate_limit_per_minute, 1)),
+        }
+    }
+
+    /// Creates a new [`RelayState`] with custom [`ReplayStore`] and [`RateLimitBackends`]
+    /// implementations (SQLite durable replay or PostgreSQL multi-replica backends).
     #[must_use]
     pub fn with_backends(
         store: Arc<dyn RegistrationStore>,
         push: Arc<dyn PushSender>,
         clock: Arc<dyn Clock>,
         replay: Arc<dyn ReplayStore>,
-        rate_limiter: Arc<dyn RateLimitStore>,
-        register_rate_limiter: Arc<dyn RateLimitStore>,
+        limiters: RateLimitBackends,
         settings: RelaySettings,
     ) -> Self {
+        let concurrency = Arc::new(Semaphore::new(settings.max_concurrent_requests.max(1)));
         Self {
             store,
             push,
             clock,
             replay,
-            rate_limiter,
-            register_rate_limiter,
+            rate_limiter: limiters.hook_per_handle,
+            register_ip_limiter: limiters.register_per_ip,
+            register_key_limiter: limiters.register_per_key,
+            register_global_limiter: limiters.register_global,
+            concurrency,
             settings: Arc::new(settings),
         }
     }
 
-    /// Prunes expired entries from the replay store and rate limiters.
+    /// Prunes expired entries from replay storage, rate limiters, and inactive registrations.
     pub async fn prune_caches(&self) {
-        let now_ms = self.clock.now_ms();
-        let evicted_nonces = match self.replay.prune_expired(now_ms).await {
+        let wall_now_ms = self.clock.now_ms();
+        let mono_now_ms = self.clock.monotonic_ms();
+
+        let evicted_nonces = match self.replay.prune_expired(wall_now_ms, mono_now_ms).await {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to prune expired replay nonces");
                 0
             }
         };
-        let evicted_handles = match self.rate_limiter.prune_expired(now_ms).await {
+        let evicted_handles = match self.rate_limiter.prune_expired(mono_now_ms).await {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to prune expired hook rate limits");
                 0
             }
         };
-        if let Err(err) = self.register_rate_limiter.prune_expired(now_ms).await {
-            tracing::warn!(error = %err, "failed to prune expired registration rate limits");
+        for (name, limiter) in [
+            ("register_ip", &self.register_ip_limiter),
+            ("register_key", &self.register_key_limiter),
+            ("register_global", &self.register_global_limiter),
+        ] {
+            if let Err(err) = limiter.prune_expired(mono_now_ms).await {
+                tracing::warn!(scope = name, error = %err, "failed to prune rate limits");
+            }
         }
-        if evicted_nonces > 0 || evicted_handles > 0 {
+        let cutoff_ms = wall_now_ms.saturating_sub(self.settings.registration_ttl_ms);
+        let evicted_registrations = match self.store.prune_expired(cutoff_ms).await {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to prune inactive registrations");
+                0
+            }
+        };
+        if evicted_nonces > 0 || evicted_handles > 0 || evicted_registrations > 0 {
             tracing::debug!(
                 evicted_nonces,
                 evicted_handles,
-                "pruned expired replay and rate-limit entries"
+                evicted_registrations,
+                "pruned expired entries"
             );
         }
     }
@@ -154,13 +206,39 @@ impl RelayState {
 }
 
 /// Builds the Axum HTTP [`Router`] exposing `/v1/register`, `/v1/hook`, and `/health`.
+///
+/// `/v1/*` routes are guarded by both a non-blocking concurrency cap (`503` when full)
+/// and an overall request deadline (`408` on slowloris/stalled clients). `/health` stays
+/// outside the `/v1/*` concurrency semaphore so health probes remain responsive.
 pub fn router(state: RelayState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/v1/register", post(handle_register))
         .route("/v1/hook", post(handle_hook))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_concurrency_and_deadline,
+        ));
+
+    Router::new()
+        .merge(api)
         .route("/health", get(handle_health))
         .fallback(handle_not_found)
         .with_state(state)
+}
+
+async fn enforce_concurrency_and_deadline(
+    State(state): State<RelayState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = state.concurrency.clone().try_acquire_owned() else {
+        return ApiError::unavailable("server at concurrency limit").into_response();
+    };
+
+    match tokio::time::timeout(state.settings.request_timeout, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => ApiError::request_timeout().into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -219,23 +297,37 @@ async fn handle_health(State(state): State<RelayState>) -> (StatusCode, Json<Hea
 
 async fn handle_register(
     State(state): State<RelayState>,
-    body: Body,
+    req: Request,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
-    let created_at_ms = state.clock.now_ms();
+    let wall_now_ms = state.clock.now_ms();
+    let mono_now_ms = state.clock.monotonic_ms();
+
+    // 1. Per-client-IP rate limit first so one abusive IP cannot burn the global quota.
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |ci| ci.0.ip());
+    let (parts, body) = req.into_parts();
+    let client_ip = state.settings.trusted_proxies.extract_client_ip(
+        peer_ip,
+        &parts.headers,
+        &state.settings.trusted_proxy_header,
+    );
+    let ip_key = ip_rate_limit_key(client_ip);
     match state
-        .register_rate_limiter
-        .check_and_record("register", created_at_ms)
+        .register_ip_limiter
+        .check_and_record(&ip_key, mono_now_ms)
         .await
     {
         Ok(Ok(())) => {}
         Ok(Err(retry_after)) => {
             return Err(ApiError::rate_limited_with_message(
                 retry_after,
-                "registration rate limit exceeded",
+                "client address registration rate limit exceeded",
             ));
         }
         Err(err) => {
-            tracing::error!(error = %err, "registration rate-limit check failed");
+            tracing::error!(error = %err, "per-IP registration rate-limit check failed");
             return Err(ApiError::internal());
         }
     }
@@ -262,32 +354,86 @@ async fn handle_register(
     validate_public_key(&push_key)
         .map_err(|e| ApiError::bad_request(format!("invalid push_key: {e}")))?;
 
+    // 2. Per-push-key rate limit so distributed callers targeting one key cannot burn global quota.
+    let key_bucket = b64_encode(&push_key);
+    match state
+        .register_key_limiter
+        .check_and_record(&key_bucket, mono_now_ms)
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(retry_after)) => {
+            return Err(ApiError::rate_limited_with_message(
+                retry_after,
+                "push key registration rate limit exceeded",
+            ));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "per-key registration rate-limit check failed");
+            return Err(ApiError::internal());
+        }
+    }
+
+    // 3. Global registration rate limit.
+    match state
+        .register_global_limiter
+        .check_and_record("register", mono_now_ms)
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(retry_after)) => {
+            return Err(ApiError::rate_limited_with_message(
+                retry_after,
+                "global registration rate limit exceeded",
+            ));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "global registration rate-limit check failed");
+            return Err(ApiError::internal());
+        }
+    }
+
+    let limits = state.settings.registration_limits();
+
     for _ in 0..MAX_HANDLE_GENERATION_ATTEMPTS {
         let handle = generate_handle().map_err(|err| {
             tracing::error!(error = %err, "failed to generate random handle");
             ApiError::internal()
         })?;
-        let registration = Registration {
-            handle: handle.clone(),
+        let candidate = Registration {
+            handle,
             platform: req.platform,
             device_token: req.device_token.clone(),
             push_key,
             apns_env,
-            created_at_ms,
+            created_at_ms: wall_now_ms,
+            last_active_at_ms: wall_now_ms,
         };
 
         match state
             .store
-            .insert(&registration, Some(state.settings.max_registrations))
+            .register_or_get(&candidate, limits, wall_now_ms)
             .await
         {
-            Ok(()) => {
-                tracing::info!(platform = %req.platform, "registered push handle");
+            Ok(RegisterOutcome::Created(handle)) => {
+                tracing::info!(platform = %req.platform, outcome = "created", "registered push handle");
+                return Ok((StatusCode::OK, Json(RegisterResponse { handle })));
+            }
+            Ok(RegisterOutcome::Existing(handle)) => {
+                tracing::info!(platform = %req.platform, outcome = "existing", "re-registered existing push handle");
                 return Ok((StatusCode::OK, Json(RegisterResponse { handle })));
             }
             Err(StoreError::DuplicateHandle) => continue,
+            Err(StoreError::PushKeyCapacityExceeded) => {
+                tracing::warn!(platform = %req.platform, "rejected registration: push key handle quota exceeded");
+                return Err(ApiError::quota_exceeded(
+                    "push key has reached its maximum active handles",
+                ));
+            }
             Err(StoreError::CapacityExceeded) => {
-                tracing::warn!("rejected registration: maximum registration capacity reached");
+                tracing::warn!(
+                    "rejected registration: maximum global registration capacity reached"
+                );
                 return Err(ApiError::unavailable("registration capacity exceeded"));
             }
             Err(err) => {
@@ -324,10 +470,14 @@ async fn handle_hook(
     let nonce = b64_decode_array::<16>(&webhook.nonce)
         .map_err(|e| ApiError::bad_request(format!("invalid nonce: {e}")))?;
 
-    // Rule 2 (Wire Format §8.3): handle must be known (else 404).
+    let wall_now_ms = state.clock.now_ms();
+    let mono_now_ms = state.clock.monotonic_ms();
+    let active_cutoff_ms = wall_now_ms.saturating_sub(state.settings.registration_ttl_ms);
+
+    // Rule 2 (Wire Format §8.3): handle must be known and not expired (else 404).
     let registration = state
         .store
-        .get(&webhook.handle)
+        .get_active(&webhook.handle, active_cutoff_ms)
         .await
         .map_err(|err| {
             tracing::error!(error = %err, "storage lookup failed on webhook");
@@ -348,18 +498,27 @@ async fn handle_hook(
     .map_err(|_| ApiError::bad_signature("webhook signature verification failed"))?;
 
     // Rule 4 (Wire Format §8.3): ts within ±5 minutes of relay clock (else 401).
-    let now_ms = state.clock.now_ms();
-    if now_ms.abs_diff(ts_ms) > MAX_TIMESTAMP_SKEW_MS {
+    if wall_now_ms.abs_diff(ts_ms) > MAX_TIMESTAMP_SKEW_MS {
         return Err(ApiError::stale_timestamp(
             "webhook timestamp outside ±5 minute window",
         ));
     }
 
-    // Rule 5 (Wire Format §8.3): nonce unseen in the last 10 minutes (else 409).
-    match state.replay.check_and_record(nonce, now_ms).await {
+    // Rule 5 (Wire Format §8.3): nonce unseen in the last 10 minutes (else 409; 503 if full).
+    match state
+        .replay
+        .check_and_record(nonce, wall_now_ms, mono_now_ms)
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return Err(ApiError::nonce_replay()),
-        Err(err) => {
+        Err(ReplayError::CapacityExceeded) => {
+            tracing::warn!("replay store at live-nonce capacity; refusing webhook");
+            return Err(ApiError::unavailable(
+                "replay cache at capacity; retry later",
+            ));
+        }
+        Err(ReplayError::Backend(err)) => {
             tracing::error!(error = %err, "replay cache lookup failed on webhook");
             return Err(ApiError::internal());
         }
@@ -368,7 +527,7 @@ async fn handle_hook(
     // Rule 6 (Wire Format §8.3): per-handle per-minute rate limit (else 429).
     match state
         .rate_limiter
-        .check_and_record(&webhook.handle, now_ms)
+        .check_and_record(&webhook.handle, mono_now_ms)
         .await
     {
         Ok(Ok(())) => {}
@@ -379,9 +538,25 @@ async fn handle_hook(
         }
     }
 
-    // Dispatch content-free wake push to APNs or FCM.
-    match state.push.send_wake(&registration).await {
-        Ok(PushOutcome::Delivered) => {
+    // Dispatch content-free wake push bounded strictly below Dispatch's 5-second timeout.
+    let delivery = tokio::time::timeout(
+        state.settings.provider_timeout,
+        state.push.send_wake(&registration),
+    )
+    .await;
+
+    match delivery {
+        Err(_) => {
+            touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
+            tracing::warn!(
+                platform = %registration.platform,
+                class = "timeout",
+                "wake push delivery exceeded provider timeout"
+            );
+            Err(ApiError::upstream("upstream push provider timed out"))
+        }
+        Ok(Ok(PushOutcome::Delivered)) => {
+            touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::debug!(platform = %registration.platform, "dispatched wake push");
             Ok((
                 StatusCode::OK,
@@ -391,7 +566,7 @@ async fn handle_hook(
                 }),
             ))
         }
-        Ok(PushOutcome::InvalidToken { reason }) => {
+        Ok(Ok(PushOutcome::InvalidToken { class })) => {
             if let Err(err) = state.store.delete(&registration.handle).await {
                 tracing::error!(
                     platform = %registration.platform,
@@ -409,8 +584,8 @@ async fn handle_hook(
             }
             tracing::info!(
                 platform = %registration.platform,
-                reason = %reason,
-                "pruned handle after upstream reported invalid device token"
+                class = %class.as_str(),
+                "pruned handle after token-specific rejection"
             );
             Ok((
                 StatusCode::OK,
@@ -420,20 +595,28 @@ async fn handle_hook(
                 }),
             ))
         }
-        Err(PushError::PlatformNotConfigured(platform)) => {
+        Ok(Err(PushError::PlatformNotConfigured(platform))) => {
+            touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::warn!(platform = %platform, "push backend not configured for platform");
             Err(ApiError::unavailable(format!(
                 "push backend not configured for {platform}"
             )))
         }
-        Err(err) => {
+        Ok(Err(err)) => {
+            touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::warn!(
                 platform = %registration.platform,
-                error = %err,
+                class = err.log_class(),
                 "wake push delivery failed"
             );
             Err(ApiError::upstream("upstream push delivery failed"))
         }
+    }
+}
+
+async fn touch_handle_best_effort(state: &RelayState, handle: &str, wall_now_ms: u64) {
+    if let Err(err) = state.store.touch_last_active(handle, wall_now_ms).await {
+        tracing::warn!(error = %err, "failed to update registration last_active_at_ms");
     }
 }
 
@@ -472,7 +655,6 @@ fn validate_device_token(platform: Platform, token: &str) -> Result<(), ApiError
     }
     match platform {
         Platform::Apns => {
-            // APNs tokens are hex-encoded bytes placed in `/3/device/{token}`.
             if token.len() < 32
                 || token.len() > 512
                 || !token.len().is_multiple_of(2)
@@ -495,5 +677,5 @@ fn validate_device_token(platform: Platform, token: &str) -> Result<(), ApiError
 }
 
 fn has_control_chars(text: &str) -> bool {
-    text.chars().any(|c| c.is_control())
+    text.chars().any(char::is_control)
 }

@@ -16,17 +16,21 @@ pub enum ErrorCode {
     StaleTimestamp,
     /// Push handle or route was not found (`404`).
     NotFound,
+    /// Request did not complete within the configured deadline (`408`).
+    RequestTimeout,
     /// Webhook nonce was already seen within the 10-minute replay window (`409`).
     NonceReplay,
     /// Request body exceeded the configured size limit (`413`).
     TooLarge,
-    /// Handle exceeded its per-minute wake push rate limit (`429`).
+    /// Caller or handle exceeded its per-minute rate limit (`429`).
     RateLimited,
+    /// Push key exceeded its active handle quota (`429`).
+    QuotaExceeded,
     /// Unexpected internal error (`500`).
     Internal,
-    /// Upstream APNs or FCM gateway returned a transient failure (`502`).
+    /// Upstream APNs or FCM gateway returned a transient failure or timed out (`502`).
     UpstreamError,
-    /// Service or platform backend is currently unavailable (`503`).
+    /// Service, storage capacity, replay capacity, or platform backend is unavailable (`503`).
     Unavailable,
 }
 
@@ -39,9 +43,11 @@ impl ErrorCode {
             Self::BadSignature => "bad_signature",
             Self::StaleTimestamp => "stale_timestamp",
             Self::NotFound => "not_found",
+            Self::RequestTimeout => "request_timeout",
             Self::NonceReplay => "nonce_replay",
             Self::TooLarge => "too_large",
             Self::RateLimited => "rate_limited",
+            Self::QuotaExceeded => "quota_exceeded",
             Self::Internal => "internal_error",
             Self::UpstreamError => "upstream_error",
             Self::Unavailable => "unavailable",
@@ -55,9 +61,10 @@ impl ErrorCode {
             Self::BadRequest => StatusCode::BAD_REQUEST,
             Self::BadSignature | Self::StaleTimestamp => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::NonceReplay => StatusCode::CONFLICT,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimited | Self::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamError => StatusCode::BAD_GATEWAY,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -125,6 +132,16 @@ impl ApiError {
         }
     }
 
+    /// Creates a `408 request_timeout` error.
+    #[must_use]
+    pub fn request_timeout() -> Self {
+        Self {
+            code: ErrorCode::RequestTimeout,
+            message: "request timed out".to_owned(),
+            retry_after: None,
+        }
+    }
+
     /// Creates a `409 nonce_replay` error.
     #[must_use]
     pub fn nonce_replay() -> Self {
@@ -158,6 +175,16 @@ impl ApiError {
             code: ErrorCode::RateLimited,
             message: message.into(),
             retry_after: Some(retry_after_secs),
+        }
+    }
+
+    /// Creates a `429 quota_exceeded` error when a push key reaches its active handle cap.
+    #[must_use]
+    pub fn quota_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::QuotaExceeded,
+            message: message.into(),
+            retry_after: None,
         }
     }
 
