@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -62,16 +63,23 @@ enum ScriptedResponse {
 }
 
 /// Scriptable mock [`PushSender`] for tests.
-#[derive(Default)]
 pub struct RecordingSender {
     recorded: Mutex<Vec<RecordedPush>>,
     scripted: Mutex<VecDeque<ScriptedResponse>>,
+    ready: AtomicBool,
+}
+
+impl Default for RecordingSender {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Debug for RecordingSender {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecordingSender")
             .field("recorded_count", &self.recorded.lock().len())
+            .field("ready", &self.ready.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -80,7 +88,16 @@ impl RecordingSender {
     /// Creates a new [`RecordingSender`] that defaults to [`PushOutcome::Delivered`].
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            recorded: Mutex::new(Vec::new()),
+            scripted: Mutex::new(VecDeque::new()),
+            ready: AtomicBool::new(true),
+        }
+    }
+
+    /// Sets whether [`PushSender::check_ready`] reports this mock provider as healthy.
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Relaxed);
     }
 
     /// Enqueues an explicit [`PushOutcome`] for the next `send_wake` call.
@@ -137,6 +154,16 @@ impl PushSender for RecordingSender {
                 None => Ok(PushOutcome::Delivered),
             }
         })
+    }
+
+    fn check_ready(&self) -> Result<(), PushError> {
+        if self.ready.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            Err(PushError::Auth {
+                class: UpstreamErrorClass::Auth,
+            })
+        }
     }
 }
 

@@ -19,12 +19,13 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 use pubky_dispatch_push_relay::client_ip::TrustedProxies;
-use pubky_dispatch_push_relay::clock::FixedClock;
+use pubky_dispatch_push_relay::clock::{Clock as _, FixedClock};
 use pubky_dispatch_push_relay::config::{ProtocolConfig, RelaySettings};
 use pubky_dispatch_push_relay::crypto::{
     SIGNATURE_HEADER, SIGNING_LABEL, b64_decode_array, b64_encode, relay_origin, sign_webhook,
 };
-use pubky_dispatch_push_relay::http::{MAX_TIMESTAMP_SKEW_MS, RelayState, router};
+use pubky_dispatch_push_relay::http::{MAX_TIMESTAMP_SKEW_MS, RelayState, metrics_router, router};
+use pubky_dispatch_push_relay::metrics::{RegistrationOutcome, WebhookOutcome};
 use pubky_dispatch_push_relay::push::noop::RecordingSender;
 use pubky_dispatch_push_relay::push::{InvalidTokenClass, PushOutcome, UpstreamErrorClass};
 use pubky_dispatch_push_relay::replay::NONCE_TTL_MS;
@@ -232,32 +233,65 @@ impl RegistrationStore for FailingStore {
 #[tokio::test]
 async fn health_endpoint_reports_ok_and_unhealthy() {
     let app = TestApp::default_dispatch().await;
-    let req = Request::builder()
-        .method("GET")
-        .uri("/health")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, body) = app.send(req).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "ok");
+    for path in ["/health", "/health/ready", "/health/live"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = app.send(req).await;
+        assert_eq!(status, StatusCode::OK, "expected 200 on {path}");
+        assert_eq!(body["status"], "ok");
+    }
 
+    // Provider credential failure flips /health and /health/ready to 503 while /health/live stays 200.
+    app.sender.set_ready(false);
+    for path in ["/health", "/health/ready"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = app.send(req).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "expected 503 on {path} when provider not ready"
+        );
+        assert_eq!(body["status"], "unhealthy");
+    }
+    let (live_status, _, _) = app
+        .send(
+            Request::builder()
+                .method("GET")
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(live_status, StatusCode::OK);
+    app.sender.set_ready(true);
+
+    // Storage failure also flips /health and /health/ready to 503.
     let failing_state = RelayState::new(
         Arc::new(FailingStore),
         Arc::new(RecordingSender::new()),
         Arc::new(FixedClock::new(BASE_TIME_MS)),
         RelaySettings::new(TEST_ORIGIN).unwrap(),
     );
-    let resp = router(failing_state)
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    for path in ["/health", "/health/ready"] {
+        let resp = router(failing_state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 #[tokio::test]
@@ -372,7 +406,7 @@ async fn hook_enforces_all_six_wire_format_8_3_rules_and_ordering() {
             .into_bytes(),
         format!(r#"{{"v":1,"\u0076":1,"handle":"{handle}","ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#)
             .into_bytes(),
-        format!(r#"{{"v":1,"handle":"","ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#).into_bytes(),
+        format!(r#"{{"v":1,"handle":123,"ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#).into_bytes(),
         format!(
             r#"{{"v":1,"handle":"{handle}","ts":"2026-01-01T00:06:00+00:00","nonce":"{nonce_ok}"}}"#
         )
@@ -392,21 +426,26 @@ async fn hook_enforces_all_six_wire_format_8_3_rules_and_ordering() {
         assert_eq!(b["code"], "bad_request");
     }
 
-    // --- Rule 2: unknown handle -> 404 (checked before signature) ---
-    let unknown_body = format!(
-        r#"{{"v":1,"handle":"unknownHandle123456789","ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#
-    );
-    let (s, _, b) = app
-        .send(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/hook")
-                .body(Body::from(unknown_body))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
-    assert_eq!(b["code"], "not_found");
+    // --- Rule 2: unknown handle -> 404 (checked before signature), including empty or control-char strings per Wire §1.7 / §8.3 ---
+    for unknown_handle in ["unknownHandle123456789", "", r"\u0007bad"] {
+        let unknown_body =
+            format!(r#"{{"v":1,"handle":"{unknown_handle}","ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#);
+        let (s, _, b) = app
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/hook")
+                    .body(Body::from(unknown_body))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "unknown handle {unknown_handle:?} must return 404 per Wire §8.3, got {b}"
+        );
+        assert_eq!(b["code"], "not_found");
+    }
 
     // --- Rule 3: signature verification -> 401 ---
     let valid_raw = format!(r#"{{"v":1,"handle":"{handle}","ts":"{ts_ok}","nonce":"{nonce_ok}"}}"#);
@@ -1172,8 +1211,9 @@ async fn register_enforces_max_registrations_cap_and_recovers_after_prune() {
     assert_eq!(s1, StatusCode::OK);
     let handle1 = b1["handle"].as_str().unwrap().to_owned();
 
-    let (s2, _) = app.register("fcm", "cap_token_2", &key, None).await;
+    let (s2, b2) = app.register("fcm", "cap_token_2", &key, None).await;
     assert_eq!(s2, StatusCode::OK);
+    let handle2 = b2["handle"].as_str().unwrap().to_owned();
 
     let (s3, b3) = app.register("fcm", "cap_token_3", &key, None).await;
     assert_eq!(s3, StatusCode::SERVICE_UNAVAILABLE);
@@ -1188,9 +1228,201 @@ async fn register_enforces_max_registrations_cap_and_recovers_after_prune() {
     assert_eq!(sh, StatusCode::OK);
     assert_eq!(bh["pruned"], true);
 
-    let (s4, _) = app.register("fcm", "cap_token_3", &key, None).await;
+    let (s4, b4) = app.register("fcm", "cap_token_3", &key, None).await;
     assert_eq!(s4, StatusCode::OK);
+    let handle3 = b4["handle"].as_str().unwrap().to_owned();
 
-    // Background prune_caches succeeds cleanly.
+    // Advance clock past both nonce TTL (10 min) and registration inactivity TTL, then sweep:
+    // verify expired nonces and expired registrations are actually removed from storage.
+    let after_ttl = BASE_TIME_MS + 91 * 24 * 60 * 60 * 1_000;
+    app.clock.set(after_ttl);
     app.state.prune_caches().await;
+    assert!(
+        app.store.get(&handle2).await.unwrap().is_none(),
+        "prune_caches must delete expired handle2"
+    );
+    assert!(
+        app.store.get(&handle3).await.unwrap().is_none(),
+        "prune_caches must delete expired handle3"
+    );
+    assert!(
+        app.state
+            .replay_store()
+            .check_and_record([90; 16], after_ttl, app.clock.monotonic_ms())
+            .await
+            .unwrap(),
+        "prune_caches must remove expired nonce [90; 16]"
+    );
+}
+
+#[tokio::test]
+async fn metrics_endpoint_tracks_all_outcomes_and_omits_sensitive_labels() {
+    let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    settings.rate_limit_per_minute = 2;
+    let app = TestApp::new(settings).await;
+    let key = key_from_seed(95);
+    let secret_token = "secret-device-token-never-in-metrics";
+    let push_key_b64 = b64_encode(key.verifying_key().as_bytes());
+
+    // Registrations: created, existing, bad_request.
+    let (s1, reg) = app.register("fcm", secret_token, &key, None).await;
+    assert_eq!(s1, StatusCode::OK);
+    let handle = reg["handle"].as_str().unwrap().to_owned();
+    let (s2, _) = app.register("fcm", secret_token, &key, None).await;
+    assert_eq!(s2, StatusCode::OK);
+    let (s_bad, _) = app
+        .register("fcm", "bad token with space", &key, None)
+        .await;
+    assert_eq!(s_bad, StatusCode::BAD_REQUEST);
+
+    // Webhook Rule 1 (bad_request)
+    let (s, _, _) = app
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/hook")
+                .body(Body::from("not-json"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Webhook Rule 2 (unknown_handle)
+    let (s, _, _) = app
+        .post_signed_hook(&key, "missing-handle", BASE_TIME_MS, [1; 16])
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Webhook Rule 3 (bad_signature)
+    let (s, _, _) = app
+        .post_signed_hook(&key_from_seed(96), &handle, BASE_TIME_MS, [2; 16])
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Webhook Rule 4 (stale_timestamp)
+    let (s, _, _) = app
+        .post_signed_hook(&key, &handle, BASE_TIME_MS - 10 * 60 * 1_000, [3; 16])
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Webhook Delivered
+    let (s, _, _) = app
+        .post_signed_hook(&key, &handle, BASE_TIME_MS, [4; 16])
+        .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Webhook Rule 5 (nonce_replay)
+    let (s, _, _) = app
+        .post_signed_hook(&key, &handle, BASE_TIME_MS, [4; 16])
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // Webhook UpstreamFailure (502)
+    app.sender
+        .enqueue_upstream_error(UpstreamErrorClass::Http5xx);
+    let (s, _, _) = app
+        .post_signed_hook(&key, &handle, BASE_TIME_MS, [5; 16])
+        .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+
+    // Webhook Rule 6 (rate_limited — 2/min limit now hit)
+    let (s, _, _) = app
+        .post_signed_hook(&key, &handle, BASE_TIME_MS, [6; 16])
+        .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+
+    // Advance 61s, then trigger Pruned
+    let t_next = BASE_TIME_MS + 61_000;
+    app.clock.set(t_next);
+    app.sender.enqueue_outcome(PushOutcome::InvalidToken {
+        class: InvalidTokenClass::FcmUnregistered,
+    });
+    let (s, _, _) = app.post_signed_hook(&key, &handle, t_next, [7; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Scrape GET /metrics via metrics_router.
+    let resp = metrics_router(app.state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(content_type.starts_with("text/plain; version=0.0.4"));
+    let body = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Assert every counter and latency observation.
+    assert_eq!(
+        app.state
+            .metrics()
+            .registration_count(RegistrationOutcome::Created),
+        1
+    );
+    assert_eq!(
+        app.state
+            .metrics()
+            .registration_count(RegistrationOutcome::Existing),
+        1
+    );
+    assert_eq!(
+        app.state
+            .metrics()
+            .registration_count(RegistrationOutcome::BadRequest),
+        1
+    );
+    for (outcome, expected) in [
+        (WebhookOutcome::BadRequest, 1),
+        (WebhookOutcome::UnknownHandle, 1),
+        (WebhookOutcome::BadSignature, 1),
+        (WebhookOutcome::StaleTimestamp, 1),
+        (WebhookOutcome::NonceReplay, 1),
+        (WebhookOutcome::RateLimited, 1),
+        (WebhookOutcome::Delivered, 1),
+        (WebhookOutcome::UpstreamFailure, 1),
+        (WebhookOutcome::Pruned, 1),
+    ] {
+        assert_eq!(
+            app.state.metrics().webhook_count(outcome),
+            expected,
+            "mismatch for webhook metric {outcome:?}"
+        );
+        assert!(body.contains(&format!(
+            "push_relay_webhooks_total{{outcome=\"{}\"}} {expected}",
+            outcome.as_str()
+        )));
+    }
+    assert!(body.contains(
+        "push_relay_provider_latency_seconds_count{platform=\"fcm\",outcome=\"delivered\"} 1"
+    ));
+    assert!(body.contains(
+        "push_relay_provider_latency_seconds_count{platform=\"fcm\",outcome=\"error\"} 1"
+    ));
+    assert!(body.contains(
+        "push_relay_provider_latency_seconds_count{platform=\"fcm\",outcome=\"pruned\"} 1"
+    ));
+
+    // Sensitive identifiers MUST NEVER appear anywhere in metrics exposition.
+    assert!(!body.contains(&handle));
+    assert!(!body.contains(secret_token));
+    assert!(!body.contains(&push_key_b64));
+    assert!(!body.contains("127.0.0.1"));
 }

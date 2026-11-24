@@ -1,11 +1,12 @@
-//! Axum HTTP router and handlers for `POST /v1/register`, `POST /v1/hook`, and `GET /health`.
+//! Axum HTTP router and handlers for `POST /v1/register`, `POST /v1/hook`, `/health*`, and `/metrics`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,7 +22,8 @@ use crate::crypto::{
 };
 use crate::error::ApiError;
 use crate::json::{check_strict_json, parse_strict_json};
-use crate::push::{PushError, PushOutcome, PushSender};
+use crate::metrics::{ProviderCallOutcome, RegistrationOutcome, RelayMetrics, WebhookOutcome};
+use crate::push::{PushError, PushOutcome, PushSender, UpstreamErrorClass};
 use crate::rate_limit::{RateLimitStore, RateLimiter};
 use crate::replay::{NONCE_TTL_MS, NonceCache, ReplayError, ReplayStore};
 use crate::store::{
@@ -50,6 +52,7 @@ pub struct RelayState {
     register_key_limiter: Arc<dyn RateLimitStore>,
     register_global_limiter: Arc<dyn RateLimitStore>,
     concurrency: Arc<Semaphore>,
+    metrics: Arc<RelayMetrics>,
     settings: Arc<RelaySettings>,
 }
 
@@ -136,6 +139,7 @@ impl RelayState {
             register_key_limiter: limiters.register_per_key,
             register_global_limiter: limiters.register_global,
             concurrency,
+            metrics: Arc::new(RelayMetrics::new()),
             settings: Arc::new(settings),
         }
     }
@@ -203,13 +207,20 @@ impl RelayState {
     pub fn rate_limiter(&self) -> &Arc<dyn RateLimitStore> {
         &self.rate_limiter
     }
+
+    /// Returns a reference to the [`RelayMetrics`] registry.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<RelayMetrics> {
+        &self.metrics
+    }
 }
 
-/// Builds the Axum HTTP [`Router`] exposing `/v1/register`, `/v1/hook`, and `/health`.
+/// Builds the Axum HTTP [`Router`] exposing `/v1/register`, `/v1/hook`, `/health`,
+/// `/health/ready`, and `/health/live`.
 ///
 /// `/v1/*` routes are guarded by both a non-blocking concurrency cap (`503` when full)
-/// and an overall request deadline (`408` on slowloris/stalled clients). `/health` stays
-/// outside the `/v1/*` concurrency semaphore so health probes remain responsive.
+/// and an overall request deadline (`408` on slowloris/stalled clients). Health endpoints
+/// stay outside the `/v1/*` concurrency semaphore so probes remain responsive.
 pub fn router(state: RelayState) -> Router {
     let api = Router::new()
         .route("/v1/register", post(handle_register))
@@ -221,8 +232,20 @@ pub fn router(state: RelayState) -> Router {
 
     Router::new()
         .merge(api)
-        .route("/health", get(handle_health))
+        .route("/health", get(handle_readiness))
+        .route("/health/ready", get(handle_readiness))
+        .route("/health/live", get(handle_liveness))
         .fallback(handle_not_found)
+        .with_state(state)
+}
+
+/// Builds the operator Axum [`Router`] exposing Prometheus metrics on `GET /metrics`.
+///
+/// Intended to be bound on a private/loopback listener (`METRICS_BIND_ADDR`) separate
+/// from public traffic.
+pub fn metrics_router(state: RelayState) -> Router {
+    Router::new()
+        .route("/metrics", get(handle_metrics))
         .with_state(state)
 }
 
@@ -280,19 +303,46 @@ async fn handle_not_found() -> ApiError {
     ApiError::not_found("route not found")
 }
 
-async fn handle_health(State(state): State<RelayState>) -> (StatusCode, Json<HealthResponse>) {
-    match state.store.ping().await {
-        Ok(()) => (StatusCode::OK, Json(HealthResponse { status: "ok" })),
-        Err(err) => {
-            tracing::error!(error = %err, "health check failed: storage ping error");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(HealthResponse {
-                    status: "unhealthy",
-                }),
-            )
-        }
+async fn handle_liveness() -> (StatusCode, Json<HealthResponse>) {
+    (StatusCode::OK, Json(HealthResponse { status: "ok" }))
+}
+
+async fn handle_readiness(State(state): State<RelayState>) -> (StatusCode, Json<HealthResponse>) {
+    if let Err(err) = state.store.ping().await {
+        tracing::error!(error = %err, "readiness check failed: storage ping error");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "unhealthy",
+            }),
+        );
     }
+    if let Err(err) = state.push.check_ready() {
+        tracing::error!(
+            class = err.log_class(),
+            "readiness check failed: push provider credentials not ready"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "unhealthy",
+            }),
+        );
+    }
+    (StatusCode::OK, Json(HealthResponse { status: "ok" }))
+}
+
+async fn handle_metrics(State(state): State<RelayState>) -> Response {
+    let body = state.metrics.render_prometheus();
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 async fn handle_register(
@@ -321,38 +371,78 @@ async fn handle_register(
     {
         Ok(Ok(())) => {}
         Ok(Err(retry_after)) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::RateLimitedIp);
             return Err(ApiError::rate_limited_with_message(
                 retry_after,
                 "client address registration rate limit exceeded",
             ));
         }
         Err(err) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::InternalError);
             tracing::error!(error = %err, "per-IP registration rate-limit check failed");
             return Err(ApiError::internal());
         }
     }
 
-    let raw = read_bounded_body(body, state.settings.max_body_bytes).await?;
-    let req: RegisterRequest =
-        parse_strict_json(&raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let raw = match read_bounded_body(body, state.settings.max_body_bytes).await {
+        Ok(b) => b,
+        Err(err) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::BadRequest);
+            return Err(err);
+        }
+    };
+    let req: RegisterRequest = match parse_strict_json(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::BadRequest);
+            return Err(ApiError::bad_request(e.to_string()));
+        }
+    };
 
-    validate_device_token(req.platform, &req.device_token)?;
+    if let Err(err) = validate_device_token(req.platform, &req.device_token) {
+        state
+            .metrics
+            .inc_registration(RegistrationOutcome::BadRequest);
+        return Err(err);
+    }
 
     let apns_env = match (req.platform, req.apns_env) {
         (Platform::Apns, Some(env)) => Some(env),
         (Platform::Apns, None) => Some(state.settings.default_apns_env),
         (Platform::Fcm, None) => None,
         (Platform::Fcm, Some(_)) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::BadRequest);
             return Err(ApiError::bad_request(
                 "apns_env is only permitted when platform is \"apns\"",
             ));
         }
     };
 
-    let push_key = b64_decode_array::<32>(&req.push_key)
-        .map_err(|e| ApiError::bad_request(format!("invalid push_key: {e}")))?;
-    validate_public_key(&push_key)
-        .map_err(|e| ApiError::bad_request(format!("invalid push_key: {e}")))?;
+    let push_key = match b64_decode_array::<32>(&req.push_key) {
+        Ok(k) => k,
+        Err(e) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::BadRequest);
+            return Err(ApiError::bad_request(format!("invalid push_key: {e}")));
+        }
+    };
+    if let Err(e) = validate_public_key(&push_key) {
+        state
+            .metrics
+            .inc_registration(RegistrationOutcome::BadRequest);
+        return Err(ApiError::bad_request(format!("invalid push_key: {e}")));
+    }
 
     // 2. Per-push-key rate limit so distributed callers targeting one key cannot burn global quota.
     let key_bucket = b64_encode(&push_key);
@@ -363,12 +453,18 @@ async fn handle_register(
     {
         Ok(Ok(())) => {}
         Ok(Err(retry_after)) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::RateLimitedKey);
             return Err(ApiError::rate_limited_with_message(
                 retry_after,
                 "push key registration rate limit exceeded",
             ));
         }
         Err(err) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::InternalError);
             tracing::error!(error = %err, "per-key registration rate-limit check failed");
             return Err(ApiError::internal());
         }
@@ -382,12 +478,18 @@ async fn handle_register(
     {
         Ok(Ok(())) => {}
         Ok(Err(retry_after)) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::RateLimitedGlobal);
             return Err(ApiError::rate_limited_with_message(
                 retry_after,
                 "global registration rate limit exceeded",
             ));
         }
         Err(err) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::InternalError);
             tracing::error!(error = %err, "global registration rate-limit check failed");
             return Err(ApiError::internal());
         }
@@ -396,10 +498,16 @@ async fn handle_register(
     let limits = state.settings.registration_limits();
 
     for _ in 0..MAX_HANDLE_GENERATION_ATTEMPTS {
-        let handle = generate_handle().map_err(|err| {
-            tracing::error!(error = %err, "failed to generate random handle");
-            ApiError::internal()
-        })?;
+        let handle = match generate_handle() {
+            Ok(h) => h,
+            Err(err) => {
+                state
+                    .metrics
+                    .inc_registration(RegistrationOutcome::InternalError);
+                tracing::error!(error = %err, "failed to generate random handle");
+                return Err(ApiError::internal());
+            }
+        };
         let candidate = Registration {
             handle,
             platform: req.platform,
@@ -416,33 +524,49 @@ async fn handle_register(
             .await
         {
             Ok(RegisterOutcome::Created(handle)) => {
+                state.metrics.inc_registration(RegistrationOutcome::Created);
                 tracing::info!(platform = %req.platform, outcome = "created", "registered push handle");
                 return Ok((StatusCode::OK, Json(RegisterResponse { handle })));
             }
             Ok(RegisterOutcome::Existing(handle)) => {
+                state
+                    .metrics
+                    .inc_registration(RegistrationOutcome::Existing);
                 tracing::info!(platform = %req.platform, outcome = "existing", "re-registered existing push handle");
                 return Ok((StatusCode::OK, Json(RegisterResponse { handle })));
             }
             Err(StoreError::DuplicateHandle) => continue,
             Err(StoreError::PushKeyCapacityExceeded) => {
+                state
+                    .metrics
+                    .inc_registration(RegistrationOutcome::QuotaExceeded);
                 tracing::warn!(platform = %req.platform, "rejected registration: push key handle quota exceeded");
                 return Err(ApiError::quota_exceeded(
                     "push key has reached its maximum active handles",
                 ));
             }
             Err(StoreError::CapacityExceeded) => {
+                state
+                    .metrics
+                    .inc_registration(RegistrationOutcome::CapacityExceeded);
                 tracing::warn!(
                     "rejected registration: maximum global registration capacity reached"
                 );
                 return Err(ApiError::unavailable("registration capacity exceeded"));
             }
             Err(err) => {
+                state
+                    .metrics
+                    .inc_registration(RegistrationOutcome::InternalError);
                 tracing::error!(error = %err, "failed to persist push registration");
                 return Err(ApiError::internal());
             }
         }
     }
 
+    state
+        .metrics
+        .inc_registration(RegistrationOutcome::InternalError);
     tracing::error!("exhausted random handle generation attempts");
     Err(ApiError::internal())
 }
@@ -452,53 +576,98 @@ async fn handle_hook(
     headers: HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, Json<HookResponse>), ApiError> {
-    let raw = read_bounded_body(body, state.settings.max_body_bytes).await?;
+    let raw = match read_bounded_body(body, state.settings.max_body_bytes).await {
+        Ok(b) => b,
+        Err(err) => {
+            state.metrics.inc_webhook(WebhookOutcome::BadRequest);
+            return Err(err);
+        }
+    };
 
     // Rule 1 (Wire Format §8.3): valid webhook JSON with v == 1 (else 400).
-    check_strict_json(&raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let webhook: WebhookBody = serde_json::from_slice(&raw)
-        .map_err(|e| ApiError::bad_request(format!("invalid webhook body: {e}")))?;
+    // Note: Wire Format §1.7 allows any JSON string for `handle`; unknown handles
+    // (including empty or control-character strings) fall through to Rule 2 (404).
+    if let Err(e) = check_strict_json(&raw) {
+        state.metrics.inc_webhook(WebhookOutcome::BadRequest);
+        return Err(ApiError::bad_request(e.to_string()));
+    }
+    let webhook: WebhookBody = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            state.metrics.inc_webhook(WebhookOutcome::BadRequest);
+            return Err(ApiError::bad_request(format!("invalid webhook body: {e}")));
+        }
+    };
 
     if webhook.v != 1 {
+        state.metrics.inc_webhook(WebhookOutcome::BadRequest);
         return Err(ApiError::bad_request("unsupported webhook version"));
     }
-    if webhook.handle.is_empty() || has_control_chars(&webhook.handle) {
-        return Err(ApiError::bad_request("invalid handle"));
-    }
-    let ts_ms = parse_rfc3339(&webhook.ts)
-        .map_err(|e| ApiError::bad_request(format!("invalid ts: {e}")))?;
-    let nonce = b64_decode_array::<16>(&webhook.nonce)
-        .map_err(|e| ApiError::bad_request(format!("invalid nonce: {e}")))?;
+    let ts_ms = match parse_rfc3339(&webhook.ts) {
+        Ok(ms) => ms,
+        Err(e) => {
+            state.metrics.inc_webhook(WebhookOutcome::BadRequest);
+            return Err(ApiError::bad_request(format!("invalid ts: {e}")));
+        }
+    };
+    let nonce = match b64_decode_array::<16>(&webhook.nonce) {
+        Ok(n) => n,
+        Err(e) => {
+            state.metrics.inc_webhook(WebhookOutcome::BadRequest);
+            return Err(ApiError::bad_request(format!("invalid nonce: {e}")));
+        }
+    };
 
     let wall_now_ms = state.clock.now_ms();
     let mono_now_ms = state.clock.monotonic_ms();
     let active_cutoff_ms = wall_now_ms.saturating_sub(state.settings.registration_ttl_ms);
 
     // Rule 2 (Wire Format §8.3): handle must be known and not expired (else 404).
-    let registration = state
+    let registration = match state
         .store
         .get_active(&webhook.handle, active_cutoff_ms)
         .await
-        .map_err(|err| {
+    {
+        Ok(Some(reg)) => reg,
+        Ok(None) => {
+            state.metrics.inc_webhook(WebhookOutcome::UnknownHandle);
+            return Err(ApiError::not_found("unknown push handle"));
+        }
+        Err(err) => {
+            state.metrics.inc_webhook(WebhookOutcome::InternalError);
             tracing::error!(error = %err, "storage lookup failed on webhook");
-            ApiError::internal()
-        })?
-        .ok_or_else(|| ApiError::not_found("unknown push handle"))?;
+            return Err(ApiError::internal());
+        }
+    };
 
     // Rule 3 (Wire Format §8.3): signature header verifies with bound push_key over
     // lp(label, relay_origin, raw_body) (else 401).
-    let signature = extract_signature_header(&headers, &state.settings.protocol.signature_header)?;
-    verify_webhook_signature(
+    let signature =
+        match extract_signature_header(&headers, &state.settings.protocol.signature_header) {
+            Ok(sig) => sig,
+            Err(err) => {
+                state.metrics.inc_webhook(WebhookOutcome::BadSignature);
+                return Err(err);
+            }
+        };
+    if verify_webhook_signature(
         &registration.push_key,
         &state.settings.protocol.signing_label,
         &state.settings.relay_origin,
         &raw,
         &signature,
     )
-    .map_err(|_| ApiError::bad_signature("webhook signature verification failed"))?;
+    .is_err()
+    {
+        state.metrics.inc_webhook(WebhookOutcome::BadSignature);
+        return Err(ApiError::bad_signature(
+            "webhook signature verification failed",
+        ));
+    }
 
     // Rule 4 (Wire Format §8.3): ts within ±5 minutes of relay clock (else 401).
     if wall_now_ms.abs_diff(ts_ms) > MAX_TIMESTAMP_SKEW_MS {
+        state.metrics.inc_webhook(WebhookOutcome::StaleTimestamp);
         return Err(ApiError::stale_timestamp(
             "webhook timestamp outside ±5 minute window",
         ));
@@ -511,14 +680,21 @@ async fn handle_hook(
         .await
     {
         Ok(true) => {}
-        Ok(false) => return Err(ApiError::nonce_replay()),
+        Ok(false) => {
+            state.metrics.inc_webhook(WebhookOutcome::NonceReplay);
+            return Err(ApiError::nonce_replay());
+        }
         Err(ReplayError::CapacityExceeded) => {
+            state
+                .metrics
+                .inc_webhook(WebhookOutcome::ReplayCapacityExceeded);
             tracing::warn!("replay store at live-nonce capacity; refusing webhook");
             return Err(ApiError::unavailable(
                 "replay cache at capacity; retry later",
             ));
         }
         Err(ReplayError::Backend(err)) => {
+            state.metrics.inc_webhook(WebhookOutcome::InternalError);
             tracing::error!(error = %err, "replay cache lookup failed on webhook");
             return Err(ApiError::internal());
         }
@@ -531,22 +707,34 @@ async fn handle_hook(
         .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(retry_after)) => return Err(ApiError::rate_limited(retry_after)),
+        Ok(Err(retry_after)) => {
+            state.metrics.inc_webhook(WebhookOutcome::RateLimited);
+            return Err(ApiError::rate_limited(retry_after));
+        }
         Err(err) => {
+            state.metrics.inc_webhook(WebhookOutcome::InternalError);
             tracing::error!(error = %err, "rate-limit check failed on webhook");
             return Err(ApiError::internal());
         }
     }
 
     // Dispatch content-free wake push bounded strictly below Dispatch's 5-second timeout.
+    let started = Instant::now();
     let delivery = tokio::time::timeout(
         state.settings.provider_timeout,
         state.push.send_wake(&registration),
     )
     .await;
+    let elapsed = started.elapsed();
 
     match delivery {
         Err(_) => {
+            state.metrics.inc_webhook(WebhookOutcome::ProviderTimeout);
+            state.metrics.observe_provider_latency(
+                registration.platform,
+                ProviderCallOutcome::Timeout,
+                elapsed,
+            );
             touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::warn!(
                 platform = %registration.platform,
@@ -556,6 +744,12 @@ async fn handle_hook(
             Err(ApiError::upstream("upstream push provider timed out"))
         }
         Ok(Ok(PushOutcome::Delivered)) => {
+            state.metrics.inc_webhook(WebhookOutcome::Delivered);
+            state.metrics.observe_provider_latency(
+                registration.platform,
+                ProviderCallOutcome::Delivered,
+                elapsed,
+            );
             touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::debug!(platform = %registration.platform, "dispatched wake push");
             Ok((
@@ -567,7 +761,13 @@ async fn handle_hook(
             ))
         }
         Ok(Ok(PushOutcome::InvalidToken { class })) => {
+            state.metrics.observe_provider_latency(
+                registration.platform,
+                ProviderCallOutcome::Pruned,
+                elapsed,
+            );
             if let Err(err) = state.store.delete(&registration.handle).await {
+                state.metrics.inc_webhook(WebhookOutcome::InternalError);
                 tracing::error!(
                     platform = %registration.platform,
                     error = %err,
@@ -582,6 +782,7 @@ async fn handle_hook(
                     "failed to clear rate-limit state for pruned handle"
                 );
             }
+            state.metrics.inc_webhook(WebhookOutcome::Pruned);
             tracing::info!(
                 platform = %registration.platform,
                 class = %class.as_str(),
@@ -596,6 +797,7 @@ async fn handle_hook(
             ))
         }
         Ok(Err(PushError::PlatformNotConfigured(platform))) => {
+            state.metrics.inc_webhook(WebhookOutcome::UpstreamFailure);
             touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::warn!(platform = %platform, "push backend not configured for platform");
             Err(ApiError::unavailable(format!(
@@ -603,6 +805,28 @@ async fn handle_hook(
             )))
         }
         Ok(Err(err)) => {
+            let is_backoff = matches!(
+                err,
+                PushError::Upstream {
+                    class: UpstreamErrorClass::Backoff,
+                    ..
+                }
+            );
+            if is_backoff {
+                state.metrics.inc_webhook(WebhookOutcome::ProviderBackoff);
+                state.metrics.observe_provider_latency(
+                    registration.platform,
+                    ProviderCallOutcome::Backoff,
+                    elapsed,
+                );
+            } else {
+                state.metrics.inc_webhook(WebhookOutcome::UpstreamFailure);
+                state.metrics.observe_provider_latency(
+                    registration.platform,
+                    ProviderCallOutcome::Error,
+                    elapsed,
+                );
+            }
             touch_handle_best_effort(&state, &registration.handle, wall_now_ms).await;
             tracing::warn!(
                 platform = %registration.platform,

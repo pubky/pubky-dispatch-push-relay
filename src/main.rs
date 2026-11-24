@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 use pubky_dispatch_push_relay::clock::SystemClock;
 use pubky_dispatch_push_relay::config::{CliArgs, LogFormat, PushBackendMode};
-use pubky_dispatch_push_relay::http::{RateLimitBackends, RelayState, router};
+use pubky_dispatch_push_relay::http::{RateLimitBackends, RelayState, metrics_router, router};
 use pubky_dispatch_push_relay::push::apns::ApnsSender;
 use pubky_dispatch_push_relay::push::fcm::FcmSender;
 use pubky_dispatch_push_relay::push::noop::NoopSender;
@@ -164,6 +164,22 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let metrics_task = if let Some(metrics_addr) = args.metrics_bind_addr {
+        let metrics_listener = TcpListener::bind(metrics_addr).await?;
+        let metrics_app = metrics_router(state.clone());
+        let mut metrics_shutdown = shutdown_tx.subscribe();
+        tracing::info!(metrics_bind_addr = %metrics_addr, "serving Prometheus metrics");
+        Some(tokio::spawn(async move {
+            let _ = axum::serve(metrics_listener, metrics_app)
+                .with_graceful_shutdown(async move {
+                    let _ = metrics_shutdown.changed().await;
+                })
+                .await;
+        }))
+    } else {
+        None
+    };
+
     let app = router(state);
     let listener = TcpListener::bind(args.bind_addr).await?;
     tracing::info!(
@@ -181,6 +197,9 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = shutdown_tx.send(true);
     let _ = sweep_task.await;
+    if let Some(task) = metrics_task {
+        let _ = task.await;
+    }
     tracing::info!("pubky-dispatch-push-relay shut down cleanly");
     Ok(())
 }

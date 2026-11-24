@@ -47,15 +47,25 @@ struct TestSchema {
     schema_name: String,
 }
 
+fn resolve_test_database_url(
+    url: Option<&str>,
+    require: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let required = require.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0");
+    match url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(valid) => Ok(Some(valid.to_owned())),
+        None if required => Err("REQUIRE_POSTGRES_TESTS is set but TEST_DATABASE_URL is missing"),
+        None => Ok(None),
+    }
+}
+
 impl TestSchema {
     async fn setup() -> Option<Self> {
-        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            assert!(
-                std::env::var("REQUIRE_POSTGRES_TESTS").is_err(),
-                "REQUIRE_POSTGRES_TESTS is set but TEST_DATABASE_URL is missing"
-            );
-            return None;
-        };
+        let url_var = std::env::var("TEST_DATABASE_URL").ok();
+        let req_var = std::env::var("REQUIRE_POSTGRES_TESTS").ok();
+        let url = resolve_test_database_url(url_var.as_deref(), req_var.as_deref())
+            .expect("PostgreSQL tests required in CI");
+        let url = url?;
 
         let mut raw = [0u8; 8];
         getrandom::fill(&mut raw).unwrap();
@@ -454,7 +464,7 @@ async fn multi_replica_http_routers_share_state_and_tolerate_replica_clock_skew(
         (state, app, sender)
     };
 
-    let (_state_a, replica_a, sender_a) =
+    let (state_a, replica_a, sender_a) =
         build_replica(schema.pool.clone(), clock_a.clone(), settings.clone()).await;
     let (_state_b, replica_b, sender_b) =
         build_replica(schema.pool.clone(), clock_b.clone(), settings.clone()).await;
@@ -518,6 +528,88 @@ async fn multi_replica_http_routers_share_state_and_tolerate_replica_clock_skew(
 
     let (s, _, _) = register_device_from(&replica_a, ip2, "fcm-multi-3", &push_key).await;
     assert_eq!(s, StatusCode::OK);
+
+    // 5. Final sweep actually deletes expired nonces and expired rate-limit buckets in PostgreSQL.
+    sqlx::query("UPDATE webhook_nonces SET expires_at_ms = 1")
+        .execute(&schema.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE rate_limit_buckets SET expires_at_ms = 1")
+        .execute(&schema.pool)
+        .await
+        .unwrap();
+    let nonces_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_nonces")
+        .fetch_one(&schema.pool)
+        .await
+        .unwrap();
+    let buckets_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_buckets")
+        .fetch_one(&schema.pool)
+        .await
+        .unwrap();
+    assert!(nonces_before > 0, "expected nonces before sweep");
+    assert!(buckets_before > 0, "expected rate buckets before sweep");
+
+    state_a.prune_caches().await;
+
+    let nonces_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_nonces")
+        .fetch_one(&schema.pool)
+        .await
+        .unwrap();
+    let buckets_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_buckets")
+        .fetch_one(&schema.pool)
+        .await
+        .unwrap();
+    assert_eq!(nonces_after, 0, "prune_caches must delete expired nonces");
+    assert_eq!(
+        buckets_after, 0,
+        "prune_caches must delete expired rate-limit buckets"
+    );
+
+    schema.teardown().await;
+}
+
+#[test]
+fn require_postgres_tests_fails_loudly_when_url_missing() {
+    assert_eq!(resolve_test_database_url(None, None), Ok(None));
+    assert_eq!(resolve_test_database_url(Some(""), Some("0")), Ok(None));
+    assert!(resolve_test_database_url(None, Some("1")).is_err());
+    assert!(resolve_test_database_url(Some("   "), Some("1")).is_err());
+    assert_eq!(
+        resolve_test_database_url(Some("postgres://u:p@localhost/db"), Some("1")),
+        Ok(Some("postgres://u:p@localhost/db".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn postgres_versioned_migrations_are_recorded_idempotent_and_checksum_verified() {
+    let Some(schema) = TestSchema::setup().await else {
+        return;
+    };
+
+    let _store1 = PostgresStore::from_pool(schema.pool.clone()).await.unwrap();
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, description, checksum FROM schema_migrations ORDER BY version",
+    )
+    .fetch_all(&schema.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[0].1, "initial");
+    assert_eq!(rows[0].2.len(), 64);
+
+    // Second startup is idempotent.
+    let _store2 = PostgresStore::from_pool(schema.pool.clone()).await.unwrap();
+
+    // Tampering with checksum makes migration verification fail loudly.
+    sqlx::query("UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 1")
+        .execute(&schema.pool)
+        .await
+        .unwrap();
+    let err = PostgresStore::from_pool(schema.pool.clone())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("checksum mismatch"));
 
     schema.teardown().await;
 }

@@ -14,6 +14,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use ring::digest::{SHA256, digest};
 use sqlx::Row as _;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -30,62 +31,32 @@ const REGISTRATION_CAP_LOCK_KEY: i64 = 0x5044_5052_5245_4731;
 /// Fixed 64-bit PostgreSQL advisory lock key serializing nonce cap checks.
 const NONCE_CAP_LOCK_KEY: i64 = 0x5044_5052_4E4F_4E31;
 
-/// Fixed 64-bit PostgreSQL advisory lock key serializing idempotent DDL across replicas.
+/// Fixed 64-bit PostgreSQL advisory lock key serializing versioned migrations across replicas.
 const SCHEMA_INIT_LOCK_KEY: i64 = 0x5044_5052_4444_4C31;
 
 /// Maximum retry attempts if a rate-limit bucket row is concurrently pruned between
 /// `INSERT ... ON CONFLICT DO NOTHING` and `SELECT ... FOR UPDATE`.
 const MAX_BUCKET_LOCK_ATTEMPTS: usize = 3;
 
-const REGISTRATIONS_TABLE_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS registrations (
-    handle            TEXT PRIMARY KEY NOT NULL,
-    platform          TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
-    device_token      TEXT NOT NULL,
-    push_key          BYTEA NOT NULL CHECK (octet_length(push_key) = 32),
-    apns_env          TEXT CHECK (apns_env IS NULL OR apns_env IN ('production', 'sandbox')),
-    created_at_ms     BIGINT NOT NULL,
-    last_active_at_ms BIGINT NOT NULL
+struct SqlMigration {
+    version: i64,
+    description: &'static str,
+    sql: &'static str,
+}
+
+const POSTGRES_MIGRATIONS: &[SqlMigration] = &[SqlMigration {
+    version: 1,
+    description: "initial",
+    sql: include_str!("../../migrations/postgres/0001_initial.sql"),
+}];
+
+const PG_SCHEMA_MIGRATIONS_TABLE_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version       BIGINT PRIMARY KEY NOT NULL,
+    description   TEXT NOT NULL,
+    checksum      TEXT NOT NULL,
+    applied_at_ms BIGINT NOT NULL
 );
-";
-
-const REGISTRATIONS_INDEX_KEY_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_registrations_push_key
-    ON registrations (push_key);
-";
-
-const REGISTRATIONS_INDEX_ACTIVE_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_registrations_last_active
-    ON registrations (last_active_at_ms);
-";
-
-/// Durable (WAL-logged) nonce table so crashes and failovers never forget live nonces.
-const NONCES_TABLE_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS webhook_nonces (
-    nonce         BYTEA PRIMARY KEY NOT NULL CHECK (octet_length(nonce) = 16),
-    expires_at_ms BIGINT NOT NULL
-);
-";
-
-const NONCES_INDEX_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_webhook_nonces_expires_at
-    ON webhook_nonces (expires_at_ms);
-";
-
-/// Durable (WAL-logged) rate-limit table shared across replicas.
-const RATE_LIMIT_TABLE_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS rate_limit_buckets (
-    scope         TEXT NOT NULL,
-    bucket_key    TEXT NOT NULL,
-    timestamps    BIGINT[] NOT NULL,
-    expires_at_ms BIGINT NOT NULL,
-    PRIMARY KEY (scope, bucket_key)
-);
-";
-
-const RATE_LIMIT_INDEX_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_expires_at
-    ON rate_limit_buckets (expires_at_ms);
 ";
 
 /// SQL expression returning PostgreSQL's own UTC epoch milliseconds so replica clock
@@ -127,23 +98,15 @@ impl PostgresStore {
         Ok(store)
     }
 
-    /// Initializes the `registrations` table and indexes if they do not already exist.
+    /// Applies all pending versioned PostgreSQL schema migrations under an advisory lock.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Backend`] if the DDL query fails.
+    /// Returns [`StoreError::Backend`] if running migrations or verifying checksums fails.
     pub async fn init_schema(&self) -> Result<(), StoreError> {
-        run_ddl(
-            &self.pool,
-            &[
-                REGISTRATIONS_TABLE_SQL,
-                REGISTRATIONS_INDEX_KEY_SQL,
-                REGISTRATIONS_INDEX_ACTIVE_SQL,
-            ],
-        )
-        .await
-        .map_err(|e| StoreError::Backend(format!("failed to initialize schema: {e}")))?;
-        Ok(())
+        apply_postgres_migrations(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(format!("failed to apply postgres migrations: {e}")))
     }
 
     /// Returns a reference to the underlying [`PgPool`] so [`PostgresReplayStore`] and
@@ -518,11 +481,9 @@ impl PostgresReplayStore {
         ttl_ms: u64,
         max_entries: usize,
     ) -> Result<Self, ReplayError> {
-        run_ddl(&pool, &[NONCES_TABLE_SQL, NONCES_INDEX_SQL])
-            .await
-            .map_err(|e| {
-                ReplayError::Backend(format!("failed to initialize webhook_nonces: {e}"))
-            })?;
+        apply_postgres_migrations(&pool).await.map_err(|e| {
+            ReplayError::Backend(format!("failed to apply postgres migrations: {e}"))
+        })?;
         Ok(Self {
             pool,
             ttl_ms,
@@ -685,11 +646,9 @@ impl PostgresRateLimitStore {
         window_ms: u64,
         max_per_window: u32,
     ) -> Result<Self, RateLimitError> {
-        run_ddl(&pool, &[RATE_LIMIT_TABLE_SQL, RATE_LIMIT_INDEX_SQL])
-            .await
-            .map_err(|e| {
-                RateLimitError::Backend(format!("failed to initialize rate_limit_buckets: {e}"))
-            })?;
+        apply_postgres_migrations(&pool).await.map_err(|e| {
+            RateLimitError::Backend(format!("failed to apply postgres migrations: {e}"))
+        })?;
         Ok(Self {
             pool,
             scope: scope.into(),
@@ -834,16 +793,77 @@ impl RateLimitStore for PostgresRateLimitStore {
     }
 }
 
-async fn run_ddl(pool: &PgPool, statements: &[&str]) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+fn migration_checksum_hex(sql: &str) -> String {
+    let sum = digest(&SHA256, sql.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in sum.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+async fn apply_postgres_migrations(pool: &PgPool) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(SCHEMA_INIT_LOCK_KEY)
         .execute(&mut *tx)
-        .await?;
-    for stmt in statements {
-        sqlx::query(stmt).execute(&mut *tx).await?;
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query(PG_SCHEMA_MIGRATIONS_TABLE_SQL)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let now_ms: i64 = sqlx::query_scalar(PG_NOW_MS_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for migration in POSTGRES_MIGRATIONS {
+        let expected_checksum = migration_checksum_hex(migration.sql);
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT checksum FROM schema_migrations WHERE version = $1")
+                .bind(migration.version)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        if let Some(found) = existing {
+            if found != expected_checksum {
+                return Err(format!(
+                    "PostgreSQL migration {} ({}) checksum mismatch: database has {found}, binary expects {expected_checksum}",
+                    migration.version, migration.description
+                ));
+            }
+            continue;
+        }
+
+        sqlx::raw_sql(migration.sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to apply PostgreSQL migration {} ({}): {e}",
+                    migration.version, migration.description
+                )
+            })?;
+
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, description, checksum, applied_at_ms) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(migration.version)
+        .bind(migration.description)
+        .bind(&expected_checksum)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
     }
-    tx.commit().await
+
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 fn map_store_err(err: sqlx::Error) -> StoreError {
