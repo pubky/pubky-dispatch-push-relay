@@ -182,7 +182,7 @@ Every option below may be configured via environment variable (and CLI flag exce
 | `MAX_REGISTRATIONS` | `--max-registrations` | `1000000` | Maximum total active registrations before returning `503`. |
 | `REGISTRATION_TTL_DAYS` | `--registration-ttl-days` | `90` | Days without a valid webhook before a registration expires (`>= 1`). |
 | `NONCE_CACHE_MAX_ENTRIES` | `--nonce-cache-max-entries` | `100000` | Maximum live nonces retained globally in replay storage (`>= 1`; returns `503` when full). |
-| `MAX_NONCES_PER_HANDLE` | `--max-nonces-per-handle` | `1000` | Maximum live nonces a single handle may retain simultaneously inside the 10-minute replay window (`>= 1`; throttles that handle with `429` without affecting other handles). |
+| `MAX_NONCES_PER_HANDLE` | `--max-nonces-per-handle` | `1000` | Maximum live nonces a single handle may retain simultaneously inside the 10-minute replay window (`1..=NONCE_CACHE_MAX_ENTRIES`; throttles that handle with `429` without affecting other handles). |
 | `PROVIDER_TIMEOUT_MS` | `--provider-timeout-ms` | `3500` | Upstream APNs/FCM timeout in ms (`100..=4500`, strictly below Dispatch's 5000 ms timeout). |
 | `REQUEST_TIMEOUT_MS` | `--request-timeout-ms` | `4500` | Overall `/v1/*` request deadline in ms (`>= 100`, slow-client protection). |
 | `MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | `256` | Maximum concurrent `/v1/*` requests before shedding with `503` (`>= 1`). |
@@ -238,11 +238,15 @@ Prefer mounting APNs `.p8` and FCM service account JSON files as read-only secre
 
 - On Unix, the relay inspects permissions on the opened file descriptor and **refuses to start** if group or world bits are set (`mode & 0o077 != 0`).
 - Both APNs P-256 and FCM RSA (`>= 2048` bits) keys are parsed and self-tested at startup so invalid or undersized keys fail before serving traffic.
+- APNs `.p8` PKCS#8 keys must contain an embedded public key (standard OpenSSL 3 and Apple Developer Portal `.p8` keys include it). If a PKCS#8 v1 `.p8` file omits `[1] publicKey`, re-encode it before starting the relay:
+  ```bash
+  openssl ec -in AuthKey.p8 | openssl pkey -out AuthKey-with-pub.p8 && chmod 600 AuthKey-with-pub.p8
+  ```
 - Inline credentials (`APNS_KEY_PEM`, `FCM_SERVICE_ACCOUNT_JSON`) are read only from environment variables into zeroizing buffers and are never accepted on the command line.
 
 ### 5. Scaling Matrix (SQLite vs PostgreSQL)
 
-Schema updates are managed via versioned, SHA-256 checksum-verified SQL migrations under `migrations/sqlite/` and `migrations/postgres/` recorded in `schema_migrations` (serialized under `BEGIN IMMEDIATE` on SQLite and `pg_advisory_xact_lock` on PostgreSQL).
+Deployments initialize a fresh database automatically on startup using the versioned, SHA-256 checksum-verified SQL migrations under `migrations/sqlite/` and `migrations/postgres/`, recorded in `schema_migrations` (serialized under `BEGIN IMMEDIATE` on SQLite and `pg_advisory_xact_lock` on PostgreSQL).
 
 | State | SQLite (single instance) | PostgreSQL (multi-replica) |
 |---|---|---|
@@ -250,7 +254,7 @@ Schema updates are managed via versioned, SHA-256 checksum-verified SQL migratio
 | `webhook_nonces` (10-minute replay) | Durable WAL SQLite (`boot_id` + wall & monotonic expiry; survives restart; `503` when full) | Shared WAL-logged PostgreSQL table using DB `clock_timestamp()` (immune to replica clock skew/failover; `503` when full) |
 | Rate limits (hook + register IP/key/global) | Instance-local bounded in-memory sliding windows (fail-closed) | Shared WAL-logged PostgreSQL `rate_limit_buckets` using DB `clock_timestamp()` |
 | Provider JWT / OAuth2 token cache | Instance-local (with generation-guarded refresh) | Instance-local per replica (with generation-guarded refresh) |
-| Provider `Retry-After` backoff | Instance-local monotonic backoff | Instance-local per replica (each replica backs off on upstream `429`/`503`) |
+| Provider `Retry-After` backoff | Instance-local monotonic backoff | Instance-local per replica (each replica backs off on upstream server-wide `500`/`503`) |
 | Concurrency cap (`MAX_CONCURRENT_REQUESTS`) | Instance-local semaphore | Instance-local per replica |
 | Prometheus `/metrics` counters & histograms | Instance-local (scraped per instance) | Instance-local per replica (aggregated by Prometheus) |
 

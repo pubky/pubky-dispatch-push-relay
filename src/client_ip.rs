@@ -95,15 +95,15 @@ impl TrustedProxies {
 
         let header_values: Vec<_> = headers.get_all(&name).iter().collect();
         for value in header_values.into_iter().rev() {
-            let Ok(text) = value.to_str() else {
-                return peer_ip;
-            };
-            for part in text.rsplit(',') {
-                let trimmed = part.trim();
+            for segment in value.as_bytes().rsplit(|&b| b == b',') {
+                let trimmed = trim_ascii_whitespace(segment);
                 if trimmed.is_empty() {
                     continue;
                 }
-                let Ok(ip) = IpAddr::from_str(trimmed) else {
+                let Ok(text) = std::str::from_utf8(trimmed) else {
+                    return peer_ip;
+                };
+                let Ok(ip) = IpAddr::from_str(text) else {
                     return peer_ip;
                 };
                 let canonical = canonicalize_ip(ip);
@@ -115,6 +115,24 @@ impl TrustedProxies {
 
         peer_ip
     }
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = bytes.split_first() {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
 }
 
 /// Converts a client IP into a privacy-preserving, deterministic rate-limit bucket key.
@@ -227,6 +245,28 @@ mod tests {
         );
         assert_eq!(
             proxies.extract_client_ip(peer, &poisoned, DEFAULT_TRUSTED_PROXY_HEADER),
+            peer
+        );
+
+        // Non-ASCII prefix on the left MUST NOT discard a valid rightmost IP appended by a proxy.
+        let mut non_ascii_left = HeaderMap::new();
+        non_ascii_left.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xffbad, 203.0.113.5, 10.0.0.1").unwrap(),
+        );
+        assert_eq!(
+            proxies.extract_client_ip(peer, &non_ascii_left, DEFAULT_TRUSTED_PROXY_HEADER),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+
+        // Non-ASCII hop to the right of an attacker IP still stops traversal safely at peer.
+        let mut non_ascii_right = HeaderMap::new();
+        non_ascii_right.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"1.2.3.4, \xffbad, 10.0.0.1").unwrap(),
+        );
+        assert_eq!(
+            proxies.extract_client_ip(peer, &non_ascii_right, DEFAULT_TRUSTED_PROXY_HEADER),
             peer
         );
     }

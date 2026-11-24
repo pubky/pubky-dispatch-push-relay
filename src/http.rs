@@ -711,46 +711,9 @@ async fn handle_hook(
         ));
     }
 
-    // Rule 5a (Wire Format §8.3): read-only replay check FIRST so replayed nonces ALWAYS
-    // return 409 before 429, while rate-limited fresh nonces never consume replay slots.
-    match state
-        .replay
-        .contains_live(nonce, wall_now_ms, mono_now_ms)
-        .await
-    {
-        Ok(true) => {
-            state.metrics.inc_webhook(WebhookOutcome::NonceReplay);
-            return Err(ApiError::nonce_replay());
-        }
-        Ok(false) => {}
-        Err(err) => {
-            state.metrics.inc_webhook(WebhookOutcome::InternalError);
-            tracing::error!(error = %err, "replay cache read check failed on webhook");
-            return Err(ApiError::internal());
-        }
-    }
-
-    // Rule 6 (Wire Format §8.3): per-handle per-minute rate limit (else 429) evaluated
-    // before inserting fresh nonces into the shared replay table.
-    match state
-        .rate_limiter
-        .check_and_record(&webhook.handle, mono_now_ms)
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(retry_after)) => {
-            state.metrics.inc_webhook(WebhookOutcome::RateLimited);
-            return Err(ApiError::rate_limited(retry_after));
-        }
-        Err(err) => {
-            state.metrics.inc_webhook(WebhookOutcome::InternalError);
-            tracing::error!(error = %err, "rate-limit check failed on webhook");
-            return Err(ApiError::internal());
-        }
-    }
-
-    // Rule 5b (Wire Format §8.3): atomically record the fresh nonce under per-handle and
-    // global live-nonce caps (409 on concurrent duplicate, 429 on per-handle cap, 503 if full).
+    // Rule 5 (Wire Format §8.3): atomically check and record the nonce BEFORE the per-minute
+    // rate limit so a rate-rejected signed webhook is remembered and cannot be replayed once
+    // the minute resets, while the per-handle active-nonce cap isolates shared replay storage.
     match state
         .replay
         .check_and_record(&webhook.handle, nonce, wall_now_ms, mono_now_ms)
@@ -778,6 +741,24 @@ async fn handle_hook(
         Err(ReplayError::Backend(err)) => {
             state.metrics.inc_webhook(WebhookOutcome::InternalError);
             tracing::error!(error = %err, "replay cache record failed on webhook");
+            return Err(ApiError::internal());
+        }
+    }
+
+    // Rule 6 (Wire Format §8.3): per-handle per-minute rate limit (else 429).
+    match state
+        .rate_limiter
+        .check_and_record(&webhook.handle, mono_now_ms)
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(retry_after)) => {
+            state.metrics.inc_webhook(WebhookOutcome::RateLimited);
+            return Err(ApiError::rate_limited(retry_after));
+        }
+        Err(err) => {
+            state.metrics.inc_webhook(WebhookOutcome::InternalError);
+            tracing::error!(error = %err, "rate-limit check failed on webhook");
             return Err(ApiError::internal());
         }
     }

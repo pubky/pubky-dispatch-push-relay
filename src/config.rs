@@ -503,6 +503,11 @@ impl CliArgs {
                 "MAX_NONCES_PER_HANDLE must be >= 1".to_owned(),
             ));
         }
+        if self.max_nonces_per_handle > self.nonce_cache_max_entries {
+            return Err(ConfigError::Invalid(
+                "MAX_NONCES_PER_HANDLE must be <= NONCE_CACHE_MAX_ENTRIES".to_owned(),
+            ));
+        }
         if self.registration_ttl_days == 0 {
             return Err(ConfigError::Invalid(
                 "REGISTRATION_TTL_DAYS must be >= 1".to_owned(),
@@ -836,6 +841,19 @@ mod tests {
         assert_eq!(settings.max_registrations, 50_000);
         assert_eq!(settings.provider_timeout, Duration::from_millis(3000));
         assert_eq!(ok.apns_push_mode, ApnsPushModeArg::Alert);
+
+        // Per-handle nonce cap must not exceed global nonce cache cap.
+        let bad_nonce_cap = CliArgs::try_parse_from([
+            "pubky-dispatch-push-relay",
+            "--relay-origin",
+            "https://push.example",
+            "--nonce-cache-max-entries",
+            "100",
+            "--max-nonces-per-handle",
+            "101",
+        ])
+        .unwrap();
+        assert!(bad_nonce_cap.to_relay_settings().is_err());
 
         // Provider timeout above 4500 ms is rejected (must stay below Dispatch's 5 s timeout).
         let bad_timeout = CliArgs::try_parse_from([

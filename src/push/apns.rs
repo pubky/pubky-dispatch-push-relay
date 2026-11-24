@@ -409,10 +409,9 @@ enum ApnsResponse {
 /// Parses a PKCS#8 (`PRIVATE KEY`) PEM P-256 private key (Apple `.p8` format) into a
 /// [`ring::signature::EcdsaKeyPair`], zeroizing intermediate key bytes on drop.
 ///
-/// Accepts all standard PKCS#8 P-256 layouts:
-/// - RFC 5958 v1/v2 with embedded `[1] publicKey` (OpenSSL 3, Apple `.p8` with `[0] namedCurve`),
-/// - RFC 5958 v1 omitting `[1] publicKey` (deriving the uncompressed P-256 public point in
-///   constant time before validating and importing into `ring`).
+/// Accepts OpenSSL 3 PKCS#8 P-256 keys directly via `ring::EcdsaKeyPair::from_pkcs8` and
+/// Apple `.p8` keys that include both inner `[0] namedCurve` and embedded `[1] publicKey`.
+/// Keys omitting an embedded public key are rejected with a startup configuration error.
 fn parse_p256_pkcs8_pem(pem: &str, rng: &SystemRandom) -> Result<EcdsaKeyPair, PushError> {
     const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
     const END: &str = "-----END PRIVATE KEY-----";
@@ -442,14 +441,13 @@ fn parse_p256_pkcs8_pem(pem: &str, rng: &SystemRandom) -> Result<EcdsaKeyPair, P
 
     let (priv_scalar, embedded_pub) = extract_p256_pkcs8_key(&der)
         .ok_or_else(|| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()))?;
-    let derived_pub;
-    let pub_bytes: &[u8] = if let Some(pub_slice) = embedded_pub {
-        pub_slice
-    } else {
-        derived_pub = p256_pubkey::public_key_from_scalar(&priv_scalar)
-            .ok_or_else(|| PushError::Config("invalid APNs .p8 P-256 private scalar".to_owned()))?;
-        &derived_pub
-    };
+    let pub_bytes = embedded_pub.ok_or_else(|| {
+        PushError::Config(
+            "APNs .p8 PKCS#8 key omits embedded publicKey; re-encode with \
+             `openssl ec -in AuthKey.p8 | openssl pkey -out AuthKey-with-pub.p8`"
+                .to_owned(),
+        )
+    })?;
 
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
@@ -581,328 +579,6 @@ fn extract_p256_pkcs8_key(der: &[u8]) -> Option<ExtractedP256Key<'_>> {
     }
 
     Some((scalar, inner_pub.or(outer_pub)))
-}
-
-/// Constant-time NIST P-256 (`secp256r1`) public-key derivation (`Q = d * G`) used only at
-/// startup when loading RFC 5958 PKCS#8 v1 `.p8` keys that omit the optional `[1] publicKey`.
-mod p256_pubkey {
-    /// P-256 prime `p = 2^256 - 2^224 + 2^192 + 2^96 - 1` in little-endian 64-bit limbs.
-    const P: [u64; 4] = [
-        0xffff_ffff_ffff_ffff,
-        0x0000_0000_ffff_ffff,
-        0x0000_0000_0000_0000,
-        0xffff_ffff_0000_0001,
-    ];
-
-    /// P-256 subgroup order `n` in little-endian 64-bit limbs.
-    const N: [u64; 4] = [
-        0xf3b9_cac2_fc63_2551,
-        0xbce6_faad_a717_9e84,
-        0xffff_ffff_ffff_ffff,
-        0xffff_ffff_0000_0000,
-    ];
-
-    /// Montgomery radix `R = 2^256 mod p` (= `1` in Montgomery representation).
-    const R: [u64; 4] = [
-        0x0000_0000_0000_0001,
-        0xffff_ffff_0000_0000,
-        0xffff_ffff_ffff_ffff,
-        0x0000_0000_ffff_fffe,
-    ];
-
-    /// P-256 curve parameter `b` in normal representation.
-    const B_RAW: [u64; 4] = [
-        0x3bce_3c3e_27d2_604b,
-        0x651d_06b0_cc53_b0f6,
-        0xb3eb_bd55_7698_86bc,
-        0x5ac6_35d8_aa3a_93e7,
-    ];
-
-    /// Generator `G_x` in normal representation.
-    const GX_RAW: [u64; 4] = [
-        0xf4a1_3945_d898_c296,
-        0x7703_7d81_2deb_33a0,
-        0xf8bc_e6e5_63a4_40f2,
-        0x6b17_d1f2_e12c_4247,
-    ];
-
-    /// Generator `G_y` in normal representation.
-    const GY_RAW: [u64; 4] = [
-        0xcbb6_4068_37bf_51f5,
-        0x2bce_3357_6b31_5ece,
-        0x8ee7_eb4a_7c0f_9e16,
-        0x4fe3_42e2_fe1a_7f9b,
-    ];
-
-    #[derive(Clone, Copy)]
-    struct Fe([u64; 4]);
-
-    #[derive(Clone, Copy)]
-    struct Point {
-        x: Fe,
-        y: Fe,
-        z: Fe,
-    }
-
-    const fn ct_select(a: [u64; 4], b: [u64; 4], mask: u64) -> [u64; 4] {
-        [
-            (a[0] & !mask) | (b[0] & mask),
-            (a[1] & !mask) | (b[1] & mask),
-            (a[2] & !mask) | (b[2] & mask),
-            (a[3] & !mask) | (b[3] & mask),
-        ]
-    }
-
-    const fn add_raw(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], u64) {
-        let mut out = [0u64; 4];
-        let mut carry = 0u128;
-        let mut i = 0;
-        while i < 4 {
-            let sum = (a[i] as u128) + (b[i] as u128) + carry;
-            out[i] = sum as u64;
-            carry = sum >> 64;
-            i += 1;
-        }
-        (out, carry as u64)
-    }
-
-    const fn sub_raw(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], u64) {
-        let mut out = [0u64; 4];
-        let mut borrow = 0u64;
-        let mut i = 0;
-        while i < 4 {
-            let (d1, b1) = a[i].overflowing_sub(b[i]);
-            let (d2, b2) = d1.overflowing_sub(borrow);
-            out[i] = d2;
-            borrow = (b1 as u64) | (b2 as u64);
-            i += 1;
-        }
-        (out, borrow)
-    }
-
-    const fn reduce_once(a: [u64; 4], carry: u64) -> Fe {
-        let (diff, borrow) = sub_raw(a, P);
-        // Select `diff` iff carry == 1 || borrow == 0.
-        let use_diff = (carry | (borrow ^ 1)).wrapping_neg();
-        Fe(ct_select(a, diff, use_diff))
-    }
-
-    const fn fe_add(a: Fe, b: Fe) -> Fe {
-        let (sum, carry) = add_raw(a.0, b.0);
-        reduce_once(sum, carry)
-    }
-
-    const fn fe_sub(a: Fe, b: Fe) -> Fe {
-        let (diff, borrow) = sub_raw(a.0, b.0);
-        let (added, _) = add_raw(diff, P);
-        Fe(ct_select(diff, added, borrow.wrapping_neg()))
-    }
-
-    /// CIOS Montgomery multiplication modulo P-256 prime `p` (exploiting `-p^{-1} mod 2^64 == 1`).
-    const fn fe_mul(a: Fe, b: Fe) -> Fe {
-        let mut t = [0u64; 5];
-        let mut i = 0;
-        while i < 4 {
-            let mut carry = 0u128;
-            let mut j = 0;
-            while j < 4 {
-                let prod = (a.0[i] as u128) * (b.0[j] as u128) + (t[j] as u128) + carry;
-                t[j] = prod as u64;
-                carry = prod >> 64;
-                j += 1;
-            }
-            let sum = (t[4] as u128) + carry;
-            t[4] = sum as u64;
-            let top = (sum >> 64) as u64;
-
-            // Montgomery reduction step: m = t[0] * (-p^{-1} mod 2^64) = t[0].
-            let m = t[0] as u128;
-            let mut r_carry = (m * (P[0] as u128) + (t[0] as u128)) >> 64;
-            let mut k = 1;
-            while k < 4 {
-                let prod = m * (P[k] as u128) + (t[k] as u128) + r_carry;
-                t[k - 1] = prod as u64;
-                r_carry = prod >> 64;
-                k += 1;
-            }
-            let last = (t[4] as u128) + r_carry;
-            t[3] = last as u64;
-            t[4] = top + ((last >> 64) as u64);
-            i += 1;
-        }
-        reduce_once([t[0], t[1], t[2], t[3]], t[4])
-    }
-
-    fn r2_mod_p() -> Fe {
-        let mut acc = Fe(R);
-        for _ in 0..256 {
-            acc = fe_add(acc, acc);
-        }
-        acc
-    }
-
-    fn to_mont(raw: [u64; 4], r2: Fe) -> Fe {
-        fe_mul(Fe(raw), r2)
-    }
-
-    fn from_mont(m: Fe) -> [u64; 4] {
-        fe_mul(m, Fe([1, 0, 0, 0])).0
-    }
-
-    /// Computes `a^(p - 2) mod p` in Montgomery form via constant-time square-and-multiply.
-    fn fe_inv(a: Fe) -> Fe {
-        // p - 2 = 0xFFFFFFFF_00000001_00000000_00000000_00000000_FFFFFFFF_FFFFFFFF_FFFFFFFD
-        const P_MINUS_2: [u64; 4] = [
-            0xffff_ffff_ffff_fffd,
-            0x0000_0000_ffff_ffff,
-            0x0000_0000_0000_0000,
-            0xffff_ffff_0000_0001,
-        ];
-        let mut res = Fe(R); // 1 in Montgomery form
-        let mut base = a;
-        for limb in P_MINUS_2 {
-            for bit in 0..64 {
-                let prod = fe_mul(res, base);
-                let mask = ((limb >> bit) & 1).wrapping_neg();
-                res = Fe(ct_select(res.0, prod.0, mask));
-                base = fe_mul(base, base);
-            }
-        }
-        res
-    }
-
-    /// Renes-Costello-Batina (2015) Algorithm 4 complete projective addition for `a = -3`.
-    fn point_add(p1: Point, p2: Point, b: Fe) -> Point {
-        let t0 = fe_mul(p1.x, p2.x);
-        let t1 = fe_mul(p1.y, p2.y);
-        let t2 = fe_mul(p1.z, p2.z);
-        let t3 = fe_add(p1.x, p1.y);
-        let t4 = fe_add(p2.x, p2.y);
-        let t3 = fe_mul(t3, t4);
-        let t4 = fe_add(t0, t1);
-        let t3 = fe_sub(t3, t4);
-        let t4 = fe_add(p1.y, p1.z);
-        let x3 = fe_add(p2.y, p2.z);
-        let t4 = fe_mul(t4, x3);
-        let x3 = fe_add(t1, t2);
-        let t4 = fe_sub(t4, x3);
-        let x3 = fe_add(p1.x, p1.z);
-        let y3 = fe_add(p2.x, p2.z);
-        let x3 = fe_mul(x3, y3);
-        let y3 = fe_add(t0, t2);
-        let y3 = fe_sub(x3, y3);
-        let z3 = fe_mul(b, t2);
-        let x3 = fe_sub(y3, z3);
-        let z3 = fe_add(x3, x3);
-        let x3 = fe_add(x3, z3);
-        let z3 = fe_sub(t1, x3);
-        let x3 = fe_add(t1, x3);
-        let y3 = fe_mul(b, y3);
-        let t1 = fe_add(t2, t2);
-        let t2 = fe_add(t1, t2);
-        let y3 = fe_sub(y3, t2);
-        let y3 = fe_sub(y3, t0);
-        let t1 = fe_add(y3, y3);
-        let y3 = fe_add(t1, y3);
-        let t1 = fe_add(t0, t0);
-        let t0 = fe_add(t1, t0);
-        let t0 = fe_sub(t0, t2);
-        let t1 = fe_mul(t4, y3);
-        let t2 = fe_mul(t0, y3);
-        let y3 = fe_mul(x3, z3);
-        let y3 = fe_add(y3, t2);
-        let x3 = fe_mul(t3, x3);
-        let x3 = fe_sub(x3, t1);
-        let z3 = fe_mul(t4, z3);
-        let t1 = fe_mul(t3, t0);
-        let z3 = fe_add(z3, t1);
-        Point {
-            x: x3,
-            y: y3,
-            z: z3,
-        }
-    }
-
-    fn point_select(a: Point, b: Point, mask: u64) -> Point {
-        Point {
-            x: Fe(ct_select(a.x.0, b.x.0, mask)),
-            y: Fe(ct_select(a.y.0, b.y.0, mask)),
-            z: Fe(ct_select(a.z.0, b.z.0, mask)),
-        }
-    }
-
-    fn limbs_from_be(bytes: &[u8; 32]) -> [u64; 4] {
-        [
-            u64::from_be_bytes([
-                bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30],
-                bytes[31],
-            ]),
-            u64::from_be_bytes([
-                bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22],
-                bytes[23],
-            ]),
-            u64::from_be_bytes([
-                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
-                bytes[15],
-            ]),
-            u64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]),
-        ]
-    }
-
-    fn limbs_to_be(limbs: [u64; 4], dst: &mut [u8]) {
-        dst[0..8].copy_from_slice(&limbs[3].to_be_bytes());
-        dst[8..16].copy_from_slice(&limbs[2].to_be_bytes());
-        dst[16..24].copy_from_slice(&limbs[1].to_be_bytes());
-        dst[24..32].copy_from_slice(&limbs[0].to_be_bytes());
-    }
-
-    /// Derives the 65-byte uncompressed SEC1 public key (`0x04 || X || Y`) for a valid
-    /// P-256 private scalar `0 < scalar < n`. Returns `None` if `scalar` is zero or `>= n`.
-    pub(super) fn public_key_from_scalar(scalar_be: &[u8; 32]) -> Option<[u8; 65]> {
-        let d = limbs_from_be(scalar_be);
-        if d == [0, 0, 0, 0] {
-            return None;
-        }
-        // Require d < n (sub_raw(d, N) must borrow).
-        let (_, borrow) = sub_raw(d, N);
-        if borrow == 0 {
-            return None;
-        }
-
-        let r2 = r2_mod_p();
-        let b = to_mont(B_RAW, r2);
-        let g = Point {
-            x: to_mont(GX_RAW, r2),
-            y: to_mont(GY_RAW, r2),
-            z: Fe(R),
-        };
-        let mut acc = Point {
-            x: Fe([0, 0, 0, 0]),
-            y: Fe(R),
-            z: Fe([0, 0, 0, 0]),
-        };
-
-        for &byte in scalar_be {
-            for bit in (0..8).rev() {
-                acc = point_add(acc, acc, b);
-                let added = point_add(acc, g, b);
-                let mask = ((u64::from(byte) >> bit) & 1).wrapping_neg();
-                acc = point_select(acc, added, mask);
-            }
-        }
-
-        let z_inv = fe_inv(acc.z);
-        let x_raw = from_mont(fe_mul(acc.x, z_inv));
-        let y_raw = from_mont(fe_mul(acc.y, z_inv));
-
-        let mut out = [0u8; 65];
-        out[0] = 0x04;
-        limbs_to_be(x_raw, &mut out[1..33]);
-        limbs_to_be(y_raw, &mut out[33..65]);
-        Some(out)
-    }
 }
 
 /// Requires explicit token-specific APNs evidence before deleting a handle:
@@ -1052,11 +728,11 @@ JuPZpk8VOSsbnrqvn8wbb67SMGiIvO0fc+LfUdrStgDJKPZM4+epIvG/
             format!("-----BEGIN PRIVATE KEY-----\n{apple_b64}\n-----END PRIVATE KEY-----");
         let kp2 = parse_p256_pkcs8_pem(&apple_pem, &rng).unwrap();
 
-        use ring::signature::{ECDSA_P256_SHA256_FIXED, KeyPair as _, UnparsedPublicKey};
+        use ring::signature::KeyPair as _;
         assert_eq!(kp1.public_key().as_ref(), kp2.public_key().as_ref());
 
-        // PKCS#8 v1 omitting `[1] publicKey` (`MEECAQAw...`), which `ring::from_pkcs8`
-        // rejects directly: our parser derives Q = d * G and imports cleanly into `ring`.
+        // PKCS#8 v1 omitting `[1] publicKey` (`MEECAQAw...`) is rejected cleanly at startup
+        // with guidance on re-encoding via OpenSSL (no custom curve math in the relay).
         let mut pkcs8_v1_no_pub = Vec::new();
         pkcs8_v1_no_pub.extend_from_slice(&[
             0x30, 0x41, // SEQUENCE (65)
@@ -1069,45 +745,16 @@ JuPZpk8VOSsbnrqvn8wbb67SMGiIvO0fc+LfUdrStgDJKPZM4+epIvG/
             0x04, 0x20, // privateKey OCTET STRING (32)
         ]);
         pkcs8_v1_no_pub.extend_from_slice(priv_key);
-        // Confirm ring::from_pkcs8 rejects this v1 layout without publicKey.
-        assert!(
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8_v1_no_pub, &rng)
-                .is_err()
-        );
         let no_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8_v1_no_pub);
         let no_pub_pem =
             format!("-----BEGIN PRIVATE KEY-----\n{no_pub_b64}\n-----END PRIVATE KEY-----");
-        let kp3 = parse_p256_pkcs8_pem(&no_pub_pem, &rng).unwrap();
-        assert_eq!(kp3.public_key().as_ref(), kp1.public_key().as_ref());
-
-        // Signature produced by the v1 key verifies against OpenSSL's original public key.
-        let sig = kp3.sign(&rng, b"pkcs8-v1-test-payload").unwrap();
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, pub_key)
-            .verify(b"pkcs8-v1-test-payload", sig.as_ref())
-            .expect("ES256 signature from PKCS#8 v1 key must verify");
-
-        // Verify P-256 generator d = 1 vector and invalid scalar rejection (0, >= n).
-        let mut one = [0u8; 32];
-        one[31] = 1;
-        let generator = p256_pubkey::public_key_from_scalar(&one).unwrap();
-        assert_eq!(generator[0], 0x04);
-        assert_eq!(
-            &generator[1..33],
-            &[
-                0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
-                0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
-                0xd8, 0x98, 0xc2, 0x96,
-            ]
+        let err = parse_p256_pkcs8_pem(&no_pub_pem, &rng).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PushError::Config(_))
+                && msg.contains("publicKey")
+                && msg.contains("openssl"),
+            "expected clear startup config error for key lacking publicKey, got: {msg}"
         );
-        assert_eq!(
-            &generator[33..65],
-            &[
-                0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f,
-                0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68,
-                0x37, 0xbf, 0x51, 0xf5,
-            ]
-        );
-        assert!(p256_pubkey::public_key_from_scalar(&[0u8; 32]).is_none());
-        assert!(p256_pubkey::public_key_from_scalar(&[0xffu8; 32]).is_none());
     }
 }

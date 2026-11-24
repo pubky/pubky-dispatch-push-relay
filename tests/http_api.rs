@@ -1502,8 +1502,18 @@ async fn rate_limited_hooks_preserve_409_order_do_not_fill_replay_and_isolate_pe
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(b["code"], "nonce_replay");
 
-    // 2. Flood of fresh nonces from rate-limited handle returns 429 WITHOUT inserting rows
-    //    into the shared replay table!
+    // 2. A fresh signed webhook rejected by Rule 6 (429) STILL records its nonce (Rule 5 before
+    //    Rule 6), so it can never be replayed after the minute resets.
+    let (s, headers, b) = app
+        .post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [3; 16])
+        .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(b["code"], "rate_limited");
+    assert!(headers.get("retry-after").is_some());
+    assert_eq!(app.replay.row_count().await.unwrap(), 3);
+
+    // 3. Further fresh nonces from h_noisy hit the per-handle active-nonce cap (3) and return
+    //    429 WITHOUT growing the shared replay table beyond max_nonces_per_handle!
     for i in 10u8..30u8 {
         let (s, _, b) = app
             .post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [i; 16])
@@ -1513,34 +1523,33 @@ async fn rate_limited_hooks_preserve_409_order_do_not_fill_replay_and_isolate_pe
     }
     assert_eq!(
         app.replay.row_count().await.unwrap(),
-        2,
-        "rate-limited webhooks must not insert rows into webhook_nonces"
+        3,
+        "per-handle nonce cap must bound rows inserted by a noisy handle"
     );
 
-    // 3. Advance 61s so rate window resets while original 2 nonces are still live in 10-min TTL.
-    //    h_noisy can record 1 more nonce (total 3 = max_nonces_per_handle); 4th is throttled
-    //    by per-handle cap (429), while unrelated h_victim still succeeds (200)!
-    let t_next = BASE_TIME_MS + 61_000;
-    app.clock.set(t_next);
-    assert_eq!(
-        app.post_signed_hook(&key_noisy, &h_noisy, t_next, [3; 16])
-            .await
-            .0,
-        StatusCode::OK
-    );
-    let (s, headers, b) = app
-        .post_signed_hook(&key_noisy, &h_noisy, t_next, [4; 16])
-        .await;
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(b["code"], "rate_limited");
-    assert!(headers.get("retry-after").is_some());
-
-    // Unrelated handle is completely isolated from h_noisy's per-handle replay cap.
+    // 4. Unrelated handle is completely isolated from h_noisy's per-handle replay cap.
     let (s_victim, _, b_victim) = app
-        .post_signed_hook(&key_victim, &h_victim, t_next, [5; 16])
+        .post_signed_hook(&key_victim, &h_victim, BASE_TIME_MS, [5; 16])
         .await;
     assert_eq!(s_victim, StatusCode::OK);
     assert_eq!(b_victim["delivered"], true);
+    let deliveries_before_replay = app.sender.recorded().len();
+
+    // 5. Advance 61s so h_noisy's 1-minute rate window resets (BASE_TIME_MS is still within the
+    //    ±5 minute timestamp window) and replay the EXACT rate-rejected signed request [3; 16]:
+    //    MUST return 409 nonce_replay and MUST NOT deliver!
+    let t_next = BASE_TIME_MS + 61_000;
+    app.clock.set(t_next);
+    let (s_replay, _, b_replay) = app
+        .post_signed_hook(&key_noisy, &h_noisy, BASE_TIME_MS, [3; 16])
+        .await;
+    assert_eq!(s_replay, StatusCode::CONFLICT);
+    assert_eq!(b_replay["code"], "nonce_replay");
+    assert_eq!(
+        app.sender.recorded().len(),
+        deliveries_before_replay,
+        "rate-rejected webhook must never be delivered on replay after the rate window resets"
+    );
 }
 
 #[tokio::test]

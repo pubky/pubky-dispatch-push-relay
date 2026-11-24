@@ -495,7 +495,11 @@ impl RegistrationStore for PostgresStore {
             let ttl_i64 = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
             let res = sqlx::query(
                 "DELETE FROM registrations \
-                 WHERE last_active_at_ms <= ((EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT - $1)",
+                 WHERE handle IN ( \
+                     SELECT handle FROM registrations \
+                     WHERE last_active_at_ms <= ((EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT - $1) \
+                     FOR UPDATE SKIP LOCKED \
+                 )",
             )
             .bind(ttl_i64)
             .execute(&self.pool)
@@ -686,12 +690,20 @@ impl ReplayStore for PostgresReplayStore {
                     .map_err(|e| ReplayError::Backend(e.to_string()))?;
 
             if usize::try_from(live_count).unwrap_or(usize::MAX) >= self.max_entries {
-                // Reclaim expired rows if any, but NEVER evict a live nonce.
-                sqlx::query("DELETE FROM webhook_nonces WHERE expires_at_ms <= $1")
-                    .bind(db_now_ms)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                // Reclaim unlocked expired rows if any (SKIP LOCKED avoids deadlocking with
+                // the background sweeper), but NEVER evict a live nonce.
+                sqlx::query(
+                    "DELETE FROM webhook_nonces \
+                     WHERE nonce IN ( \
+                         SELECT nonce FROM webhook_nonces \
+                         WHERE expires_at_ms <= $1 \
+                         FOR UPDATE SKIP LOCKED \
+                     )",
+                )
+                .bind(db_now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ReplayError::Backend(e.to_string()))?;
                 tx.commit()
                     .await
                     .map_err(|e| ReplayError::Backend(e.to_string()))?;
@@ -747,7 +759,11 @@ impl ReplayStore for PostgresReplayStore {
         Box::pin(async move {
             let done = sqlx::query(
                 "DELETE FROM webhook_nonces \
-                 WHERE expires_at_ms <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+                 WHERE nonce IN ( \
+                     SELECT nonce FROM webhook_nonces \
+                     WHERE expires_at_ms <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT \
+                     FOR UPDATE SKIP LOCKED \
+                 )",
             )
             .execute(&self.pool)
             .await
@@ -979,7 +995,11 @@ impl RateLimitStore for PostgresRateLimitStore {
                 if usize::try_from(total_buckets).unwrap_or(usize::MAX) >= self.max_buckets {
                     sqlx::query(
                         "DELETE FROM rate_limit_buckets \
-                         WHERE scope = $1 AND expires_at_ms <= $2",
+                         WHERE (scope, bucket_key) IN ( \
+                             SELECT scope, bucket_key FROM rate_limit_buckets \
+                             WHERE scope = $1 AND expires_at_ms <= $2 \
+                             FOR UPDATE SKIP LOCKED \
+                         )",
                     )
                     .bind(&self.scope)
                     .bind(db_now_i64)
@@ -1098,8 +1118,12 @@ impl RateLimitStore for PostgresRateLimitStore {
         Box::pin(async move {
             let done = sqlx::query(
                 "DELETE FROM rate_limit_buckets \
-                 WHERE scope = $1 \
-                   AND expires_at_ms <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+                 WHERE (scope, bucket_key) IN ( \
+                     SELECT scope, bucket_key FROM rate_limit_buckets \
+                     WHERE scope = $1 \
+                       AND expires_at_ms <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT \
+                     FOR UPDATE SKIP LOCKED \
+                 )",
             )
             .bind(&self.scope)
             .execute(&self.pool)
