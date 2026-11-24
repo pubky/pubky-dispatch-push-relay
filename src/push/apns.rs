@@ -135,6 +135,7 @@ struct JwtClaims<'a> {
 #[derive(Deserialize)]
 struct ApnsErrorBody {
     reason: Option<String>,
+    timestamp: Option<u64>,
 }
 
 /// APNs HTTP/2 wake push provider.
@@ -352,34 +353,45 @@ impl ApnsSender {
         }
 
         let status_code = status.as_u16();
-        if matches!(status_code, 429 | 503)
+        // Only trigger provider-wide backoff on server-wide 500/503 responses.
+        // Apple documents 429 TooManyRequests as per-device-token, so one noisy device
+        // must not pause unrelated devices on this provider.
+        if matches!(status_code, 500 | 503)
             && let Some(delay_ms) = parse_retry_after_ms(response.headers(), self.clock.now_ms())
         {
             self.backoff.record(self.clock.monotonic_ms(), delay_ms);
         }
 
-        let reason = response
+        let err_body = response
             .bytes()
             .await
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<ApnsErrorBody>(&bytes).ok())
-            .and_then(|body| body.reason);
+            .and_then(|bytes| serde_json::from_slice::<ApnsErrorBody>(&bytes).ok());
+        let reason = err_body.as_ref().and_then(|b| b.reason.as_deref());
+        let invalidation_ts = err_body.as_ref().and_then(|b| b.timestamp);
 
-        if status_code == 403 && reason.as_deref() == Some("ExpiredProviderToken") {
+        if status_code == 403 && reason == Some("ExpiredProviderToken") {
             return Ok(ApnsResponse::ExpiredToken { generation });
         }
 
         if status_code == 403
             && matches!(
-                reason.as_deref(),
+                reason,
                 Some("InvalidProviderToken" | "MissingProviderToken")
             )
         {
             self.auth_healthy.store(false, Ordering::Relaxed);
         }
 
-        if let Some(class) = classify_invalid_apns_token(status_code, reason.as_deref()) {
-            return Ok(ApnsResponse::Outcome(PushOutcome::InvalidToken { class }));
+        if let Some(class) = classify_invalid_apns_token(status_code, reason) {
+            let invalidated_at_ms = match class {
+                InvalidTokenClass::ApnsUnregistered => invalidation_ts,
+                _ => None,
+            };
+            return Ok(ApnsResponse::Outcome(PushOutcome::InvalidToken {
+                class,
+                invalidated_at_ms,
+            }));
         }
 
         Err(PushError::Upstream {
@@ -395,7 +407,11 @@ enum ApnsResponse {
 }
 
 /// Parses a PKCS#8 (`PRIVATE KEY`) PEM P-256 private key (Apple `.p8` format) into a
-/// [`ring::signature::EcdsaKeyPair`], zeroizing intermediate DER bytes on drop.
+/// [`ring::signature::EcdsaKeyPair`], zeroizing intermediate key bytes on drop.
+///
+/// Accepts OpenSSL 3 PKCS#8 P-256 keys directly via `ring::EcdsaKeyPair::from_pkcs8` and
+/// Apple `.p8` keys that include both inner `[0] namedCurve` and embedded `[1] publicKey`.
+/// Keys omitting an embedded public key are rejected with a startup configuration error.
 fn parse_p256_pkcs8_pem(pem: &str, rng: &SystemRandom) -> Result<EcdsaKeyPair, PushError> {
     const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
     const END: &str = "-----END PRIVATE KEY-----";
@@ -423,58 +439,146 @@ fn parse_p256_pkcs8_pem(pem: &str, rng: &SystemRandom) -> Result<EcdsaKeyPair, P
         return Ok(kp);
     }
 
-    // Apple Developer Portal `.p8` files often include a redundant `[0] namedCurve` tag
-    // inside the inner SEC1 ECPrivateKey (`MIGTAgEA...`), which `ring::from_pkcs8` rejects.
-    // Extract the 32-byte private scalar and 65-byte uncompressed public key from that layout.
-    if let Some((priv_key, pub_key)) = parse_apple_p8_pkcs8_with_named_curve(&der) {
-        return EcdsaKeyPair::from_private_key_and_public_key(
-            &ECDSA_P256_SHA256_FIXED_SIGNING,
-            priv_key,
-            pub_key,
-            rng,
+    let (priv_scalar, embedded_pub) = extract_p256_pkcs8_key(&der)
+        .ok_or_else(|| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()))?;
+    let pub_bytes = embedded_pub.ok_or_else(|| {
+        PushError::Config(
+            "APNs .p8 PKCS#8 key omits embedded publicKey; re-encode with \
+             `openssl ec -in AuthKey.p8 | openssl pkey -out AuthKey-with-pub.p8`"
+                .to_owned(),
         )
-        .map_err(|_| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()));
-    }
+    })?;
 
-    Err(PushError::Config(
-        "invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned(),
-    ))
+    EcdsaKeyPair::from_private_key_and_public_key(
+        &ECDSA_P256_SHA256_FIXED_SIGNING,
+        priv_scalar.as_ref(),
+        pub_bytes,
+        rng,
+    )
+    .map_err(|_| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()))
 }
 
-/// Parses Apple's 138-byte PKCS#8 P-256 DER (`MIGTAgEA...`) carrying both `[0] namedCurve`
-/// and `[1] publicKey` inside the inner SEC1 `ECPrivateKey`.
-fn parse_apple_p8_pkcs8_with_named_curve(der: &[u8]) -> Option<(&[u8], &[u8])> {
-    // Prefix: SEQUENCE (147) { INTEGER 0, AlgorithmIdentifier(ecPublicKey, prime256v1),
-    // OCTET STRING (121) { SEQUENCE (119) { INTEGER 1, OCTET STRING (32) ... } } }
-    const PREFIX: &[u8] = &[
-        0x30, 0x81, 0x93, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
-        0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x79, 0x30,
-        0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
-    ];
-    // Middle: [0] prime256v1 OID + [1] BIT STRING (65-byte uncompressed point)
-    const MIDDLE: &[u8] = &[
-        0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0xa1, 0x44, 0x03,
-        0x42, 0x00,
-    ];
-    let expected_len = PREFIX.len() + 32 + MIDDLE.len() + 65;
-    if der.len() != expected_len {
+/// OID 1.2.840.10045.2.1 (`id-ecPublicKey`) TLV bytes.
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+/// OID 1.2.840.10045.3.1.7 (`prime256v1` / NIST P-256) TLV bytes.
+const OID_PRIME256V1: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+/// Parses an ASN.1 DER TLV element, returning `(tag, value_slice, remainder)`.
+fn der_read_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&len_byte, rest) = rest.split_first()?;
+    let (len, rest) = if len_byte & 0x80 == 0 {
+        (usize::from(len_byte), rest)
+    } else {
+        let num_bytes = usize::from(len_byte & 0x7f);
+        if num_bytes == 0 || num_bytes > 2 || rest.len() < num_bytes {
+            return None;
+        }
+        let mut len = 0usize;
+        for &b in &rest[..num_bytes] {
+            len = (len << 8) | usize::from(b);
+        }
+        (len, &rest[num_bytes..])
+    };
+    if rest.len() < len {
         return None;
     }
-    if !der.starts_with(PREFIX) {
+    Some((tag, &rest[..len], &rest[len..]))
+}
+
+type ExtractedP256Key<'a> = (Zeroizing<[u8; 32]>, Option<&'a [u8]>);
+
+/// Extracts the 32-byte big-endian P-256 private scalar (wrapped in [`Zeroizing`]) and an
+/// optional 65-byte uncompressed public key from an RFC 5958 PKCS#8 `PrivateKeyInfo` DER blob.
+fn extract_p256_pkcs8_key(der: &[u8]) -> Option<ExtractedP256Key<'_>> {
+    let (tag, seq, trailing) = der_read_tlv(der)?;
+    if tag != 0x30 || !trailing.is_empty() {
         return None;
     }
-    let priv_start = PREFIX.len();
-    let mid_start = priv_start + 32;
-    let pub_start = mid_start + MIDDLE.len();
-    if der.get(mid_start..pub_start) != Some(MIDDLE) {
+
+    // 1. version INTEGER (0 or 1)
+    let (v_tag, v_val, rest) = der_read_tlv(seq)?;
+    if v_tag != 0x02 || !matches!(v_val, [0x00] | [0x01]) {
         return None;
     }
-    let priv_key = der.get(priv_start..mid_start)?;
-    let pub_key = der.get(pub_start..)?;
-    if pub_key.first() != Some(&0x04) {
+
+    // 2. privateKeyAlgorithm SEQUENCE { id-ecPublicKey, prime256v1 }
+    let (alg_tag, alg_val, rest) = der_read_tlv(rest)?;
+    if alg_tag != 0x30 {
         return None;
     }
-    Some((priv_key, pub_key))
+    let alg_expected_len = OID_EC_PUBLIC_KEY.len() + OID_PRIME256V1.len();
+    if alg_val.len() != alg_expected_len
+        || !alg_val.starts_with(OID_EC_PUBLIC_KEY)
+        || !alg_val.ends_with(OID_PRIME256V1)
+    {
+        return None;
+    }
+
+    // 3. privateKey OCTET STRING wrapping SEC1 ECPrivateKey
+    let (pk_tag, pk_octets, mut outer_rest) = der_read_tlv(rest)?;
+    if pk_tag != 0x04 {
+        return None;
+    }
+
+    // Optional RFC 5958 [0] attributes / [1] publicKey BIT STRING
+    let mut outer_pub: Option<&[u8]> = None;
+    while !outer_rest.is_empty() {
+        let (opt_tag, opt_val, next) = der_read_tlv(outer_rest)?;
+        if opt_tag == 0x81 {
+            // IMPLICIT BIT STRING: leading unused-bits byte 0x00 followed by 65-byte uncompressed point
+            if opt_val.len() == 66 && opt_val[0] == 0x00 && opt_val[1] == 0x04 {
+                outer_pub = Some(&opt_val[1..]);
+            }
+        }
+        outer_rest = next;
+    }
+
+    // Parse inner SEC1 ECPrivateKey SEQUENCE
+    let (ec_tag, ec_seq, ec_trailing) = der_read_tlv(pk_octets)?;
+    if ec_tag != 0x30 || !ec_trailing.is_empty() {
+        return None;
+    }
+    let (ec_ver_tag, ec_ver_val, ec_rest) = der_read_tlv(ec_seq)?;
+    if ec_ver_tag != 0x02 || ec_ver_val != [0x01] {
+        return None;
+    }
+    let (priv_tag, priv_val, mut ec_rest) = der_read_tlv(ec_rest)?;
+    if priv_tag != 0x04 || priv_val.is_empty() || priv_val.len() > 32 {
+        return None;
+    }
+    let mut scalar = Zeroizing::new([0u8; 32]);
+    scalar[32 - priv_val.len()..].copy_from_slice(priv_val);
+
+    let mut inner_pub: Option<&[u8]> = None;
+    while !ec_rest.is_empty() {
+        let (opt_tag, opt_val, next) = der_read_tlv(ec_rest)?;
+        match opt_tag {
+            // Optional [0] namedCurve MUST match prime256v1 if present
+            0xa0 => {
+                if opt_val != OID_PRIME256V1 {
+                    return None;
+                }
+            }
+            // Optional [1] publicKey BIT STRING
+            0xa1 => {
+                let (bs_tag, bs_val, bs_trail) = der_read_tlv(opt_val)?;
+                if bs_tag != 0x03 || !bs_trail.is_empty() || bs_val.len() != 66 || bs_val[0] != 0x00
+                {
+                    return None;
+                }
+                if bs_val[1] != 0x04 {
+                    return None;
+                }
+                inner_pub = Some(&bs_val[1..]);
+            }
+            _ => return None,
+        }
+        ec_rest = next;
+    }
+
+    Some((scalar, inner_pub.or(outer_pub)))
 }
 
 /// Requires explicit token-specific APNs evidence before deleting a handle:
@@ -515,13 +619,15 @@ impl PushSender for ApnsSender {
         })
     }
 
-    fn check_ready(&self) -> Result<(), PushError> {
-        if !self.auth_healthy.load(Ordering::Relaxed) {
-            return Err(PushError::Auth {
-                class: UpstreamErrorClass::Auth,
-            });
-        }
-        self.bearer_jwt().map(|_| ())
+    fn check_ready(&self) -> BoxFuture<'_, Result<(), PushError>> {
+        Box::pin(async move {
+            if !self.auth_healthy.load(Ordering::Relaxed) {
+                return Err(PushError::Auth {
+                    class: UpstreamErrorClass::Auth,
+                });
+            }
+            self.bearer_jwt().map(|_| ())
+        })
     }
 }
 
@@ -624,5 +730,31 @@ JuPZpk8VOSsbnrqvn8wbb67SMGiIvO0fc+LfUdrStgDJKPZM4+epIvG/
 
         use ring::signature::KeyPair as _;
         assert_eq!(kp1.public_key().as_ref(), kp2.public_key().as_ref());
+
+        // PKCS#8 v1 omitting `[1] publicKey` (`MEECAQAw...`) is rejected cleanly at startup
+        // with guidance on re-encoding via OpenSSL (no custom curve math in the relay).
+        let mut pkcs8_v1_no_pub = Vec::new();
+        pkcs8_v1_no_pub.extend_from_slice(&[
+            0x30, 0x41, // SEQUENCE (65)
+            0x02, 0x01, 0x00, // version 0
+            0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+            0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // ecPublicKey + prime256v1
+            0x04, 0x27, // OCTET STRING (39)
+            0x30, 0x25, // ECPrivateKey SEQUENCE (37)
+            0x02, 0x01, 0x01, // version 1
+            0x04, 0x20, // privateKey OCTET STRING (32)
+        ]);
+        pkcs8_v1_no_pub.extend_from_slice(priv_key);
+        let no_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8_v1_no_pub);
+        let no_pub_pem =
+            format!("-----BEGIN PRIVATE KEY-----\n{no_pub_b64}\n-----END PRIVATE KEY-----");
+        let err = parse_p256_pkcs8_pem(&no_pub_pem, &rng).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PushError::Config(_))
+                && msg.contains("publicKey")
+                && msg.contains("openssl"),
+            "expected clear startup config error for key lacking publicKey, got: {msg}"
+        );
     }
 }

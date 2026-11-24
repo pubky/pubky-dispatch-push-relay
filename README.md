@@ -25,7 +25,7 @@ Pubky Dispatch separates inbox hosting from mobile push delivery so neither serv
 
 ### Provider timeout and what a wallet sees
 
-Upstream APNs and FCM calls are bounded strictly below Pubky Dispatch's 5-second webhook timeout (`PROVIDER_TIMEOUT_MS`, default `3500` ms, maximum `4500` ms). If a provider does not answer in time, the relay responds `502`, preserves the handle, and Dispatch retries once with a fresh nonce. If the provider accepted the original push just after the relay's timeout elapsed, **a wallet may observe at most one duplicate wake** for that message; syncing from Dispatch is already idempotent.
+Upstream APNs and FCM calls are bounded strictly below Pubky Dispatch's 5-second webhook timeout (`PROVIDER_TIMEOUT_MS`, default `3500` ms, maximum `4500` ms). If a provider does not answer in time, the relay responds `502`, preserves the handle, and Dispatch may retry up to 3 total attempts (Wire Format §8.2), each with a fresh nonce. If a provider accepted an earlier attempt just after the relay's provider timeout (or outer `REQUEST_TIMEOUT_MS` `408` deadline, which also bounds database work) elapsed, **a wallet may observe at most two duplicate wakes** for that event; syncing from Dispatch is already idempotent.
 
 ---
 
@@ -56,7 +56,7 @@ Content-Type: application/json
 | `platform` | `"apns" \| "fcm"` | yes | Target mobile push gateway. |
 | `device_token` | `string` | yes | 1..=4096 bytes, no whitespace or control chars. `apns`: even-length ASCII hex (`32..=512` chars). `fcm`: printable ASCII (`0x21..=0x7E`, `1..=4096` chars). |
 | `push_key` | `b64(32)` | yes | Unpadded base64url (43 chars) encoding a canonical, non-small-order Ed25519 public key. |
-| `apns_env` | `"production" \| "sandbox"` | no | Permitted only when `platform == "apns"` (defaults to `APNS_DEFAULT_ENV`, default `production`). Rejected with `400` for `fcm`. |
+| `apns_env` | `"production" \| "sandbox" \| null` | no | Permitted only when `platform == "apns"` (omitted or `null` defaults to `APNS_DEFAULT_ENV`, default `production`). Non-null values are rejected with `400` for `fcm`; `"apns_env": null` is treated identically to omitting the field. |
 
 Unknown fields are rejected (`400`).
 
@@ -83,7 +83,7 @@ Unknown fields are rejected (`400`).
 | HTTP Status | Error `code` | Meaning |
 |---|---|---|
 | `400` | `bad_request` | Malformed JSON, unknown fields, invalid `device_token`, invalid/small-order `push_key`, or `apns_env` supplied for `fcm`. |
-| `408` | `request_timeout` | Client stalled while sending the request body past `REQUEST_TIMEOUT_MS`. |
+| `408` | `request_timeout` | Full request handling (client body reads, database work, or upstream delivery) exceeded `REQUEST_TIMEOUT_MS`. |
 | `413` | `too_large` | Body exceeded 16 KiB. |
 | `429` | `rate_limited` | Per-IP (`REGISTER_IP_RATE_LIMIT_PER_MINUTE`), per-`push_key` (`REGISTER_KEY_RATE_LIMIT_PER_MINUTE`), or global (`REGISTER_RATE_LIMIT_PER_MINUTE`) limit exceeded. Includes `Retry-After` header and `retry_after` JSON field. |
 | `429` | `quota_exceeded` | Active handles bound to this `push_key` reached `MAX_HANDLES_PER_PUSH_KEY` (default `32`). Existing handles are never evicted. |
@@ -173,7 +173,7 @@ Every option below may be configured via environment variable (and CLI flag exce
 | `RELAY_ORIGIN` | `--relay-origin` | *(required)* | Exact `https://<host>` origin verified in webhook signatures (no port, path, query, or userinfo; preserves host casing). |
 | `RELAY_BIND_ADDR` | `--bind-addr` | `0.0.0.0:8080` | TCP socket address for public API and health probes. |
 | `METRICS_BIND_ADDR` | `--metrics-bind-addr` | *(unset)* | Optional separate socket address for Prometheus `GET /metrics` (e.g. `127.0.0.1:9090`). Disabled when unset. |
-| `DATABASE_URL` | `--database-url` | `./data/push-relay.sqlite` | `postgres://` or `postgresql://` selects PostgreSQL; any other path/URL (`sqlite://...`, `:memory:`) selects SQLite. Value hidden from `--help` and `Debug`. |
+| `DATABASE_URL` | `--database-url` | `./data/push-relay.sqlite` | `postgres://` or `postgresql://` selects PostgreSQL; any other path/URL (`sqlite://...`, `:memory:`) selects SQLite. Value hidden from `--help` and `Debug`. Note: the container image (`Dockerfile`) overrides this default to `/var/lib/pubky-dispatch-push-relay/push-relay.sqlite`. |
 | `RATE_LIMIT_PER_MINUTE` | `--rate-limit-per-minute` | `60` | Maximum webhooks per handle per rolling 60 s window (`429`). |
 | `REGISTER_IP_RATE_LIMIT_PER_MINUTE` | `--register-ip-rate-limit-per-minute` | `10` | Maximum `POST /v1/register` requests per client IP bucket per 60 s (`429`). |
 | `REGISTER_KEY_RATE_LIMIT_PER_MINUTE` | `--register-key-rate-limit-per-minute` | `20` | Maximum `POST /v1/register` requests per `push_key` per 60 s (`429`). |
@@ -181,7 +181,8 @@ Every option below may be configured via environment variable (and CLI flag exce
 | `MAX_HANDLES_PER_PUSH_KEY` | `--max-handles-per-push-key` | `32` | Maximum active handles per `push_key` (`429 quota_exceeded`; never evicts). |
 | `MAX_REGISTRATIONS` | `--max-registrations` | `1000000` | Maximum total active registrations before returning `503`. |
 | `REGISTRATION_TTL_DAYS` | `--registration-ttl-days` | `90` | Days without a valid webhook before a registration expires (`>= 1`). |
-| `NONCE_CACHE_MAX_ENTRIES` | `--nonce-cache-max-entries` | `100000` | Maximum live nonces retained in replay storage (`>= 1`; returns `503` when full). |
+| `NONCE_CACHE_MAX_ENTRIES` | `--nonce-cache-max-entries` | `100000` | Maximum live nonces retained globally in replay storage (`>= 1`; returns `503` when full). |
+| `MAX_NONCES_PER_HANDLE` | `--max-nonces-per-handle` | `1000` | Maximum live nonces a single handle may retain simultaneously inside the 10-minute replay window (`1..=NONCE_CACHE_MAX_ENTRIES`; throttles that handle with `429` without affecting other handles). |
 | `PROVIDER_TIMEOUT_MS` | `--provider-timeout-ms` | `3500` | Upstream APNs/FCM timeout in ms (`100..=4500`, strictly below Dispatch's 5000 ms timeout). |
 | `REQUEST_TIMEOUT_MS` | `--request-timeout-ms` | `4500` | Overall `/v1/*` request deadline in ms (`>= 100`, slow-client protection). |
 | `MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | `256` | Maximum concurrent `/v1/*` requests before shedding with `503` (`>= 1`). |
@@ -237,11 +238,15 @@ Prefer mounting APNs `.p8` and FCM service account JSON files as read-only secre
 
 - On Unix, the relay inspects permissions on the opened file descriptor and **refuses to start** if group or world bits are set (`mode & 0o077 != 0`).
 - Both APNs P-256 and FCM RSA (`>= 2048` bits) keys are parsed and self-tested at startup so invalid or undersized keys fail before serving traffic.
+- APNs `.p8` PKCS#8 keys must contain an embedded public key (standard OpenSSL 3 and Apple Developer Portal `.p8` keys include it). If a PKCS#8 v1 `.p8` file omits `[1] publicKey`, re-encode it before starting the relay:
+  ```bash
+  openssl ec -in AuthKey.p8 | openssl pkey -out AuthKey-with-pub.p8 && chmod 600 AuthKey-with-pub.p8
+  ```
 - Inline credentials (`APNS_KEY_PEM`, `FCM_SERVICE_ACCOUNT_JSON`) are read only from environment variables into zeroizing buffers and are never accepted on the command line.
 
 ### 5. Scaling Matrix (SQLite vs PostgreSQL)
 
-Schema updates are managed via versioned, SHA-256 checksum-verified SQL migrations under `migrations/sqlite/` and `migrations/postgres/` recorded in `schema_migrations` (serialized under `BEGIN IMMEDIATE` on SQLite and `pg_advisory_xact_lock` on PostgreSQL).
+Deployments initialize a fresh database automatically on startup using the versioned, SHA-256 checksum-verified SQL migrations under `migrations/sqlite/` and `migrations/postgres/`, recorded in `schema_migrations` (serialized under `BEGIN IMMEDIATE` on SQLite and `pg_advisory_xact_lock` on PostgreSQL).
 
 | State | SQLite (single instance) | PostgreSQL (multi-replica) |
 |---|---|---|
@@ -249,7 +254,7 @@ Schema updates are managed via versioned, SHA-256 checksum-verified SQL migratio
 | `webhook_nonces` (10-minute replay) | Durable WAL SQLite (`boot_id` + wall & monotonic expiry; survives restart; `503` when full) | Shared WAL-logged PostgreSQL table using DB `clock_timestamp()` (immune to replica clock skew/failover; `503` when full) |
 | Rate limits (hook + register IP/key/global) | Instance-local bounded in-memory sliding windows (fail-closed) | Shared WAL-logged PostgreSQL `rate_limit_buckets` using DB `clock_timestamp()` |
 | Provider JWT / OAuth2 token cache | Instance-local (with generation-guarded refresh) | Instance-local per replica (with generation-guarded refresh) |
-| Provider `Retry-After` backoff | Instance-local monotonic backoff | Instance-local per replica (each replica backs off on upstream `429`/`503`) |
+| Provider `Retry-After` backoff | Instance-local monotonic backoff | Instance-local per replica (each replica backs off on upstream server-wide `500`/`503`) |
 | Concurrency cap (`MAX_CONCURRENT_REQUESTS`) | Instance-local semaphore | Instance-local per replica |
 | Prometheus `/metrics` counters & histograms | Instance-local (scraped per instance) | Instance-local per replica (aggregated by Prometheus) |
 
@@ -292,8 +297,9 @@ docker run --rm -p 8080:8080 -p 127.0.0.1:9090:9090 \
 
 ### What a stolen `push_key` allows
 
-- **Allows:** Signing valid `POST /v1/hook` requests for any handle bound to that `push_key`, causing the relay to deliver content-free wake pushes to those registered devices up to `RATE_LIMIT_PER_MINUTE` (wake spam / battery drain).
-- **Does NOT allow:** Reading message contents, learning Pubky identities, reading stored device tokens, triggering handles bound to any other `push_key`, or redirecting existing handles to different tokens. Rotating the `push_key` in Dispatch and re-registering devices cuts off the compromised key.
+- **Allows:** Signing valid `POST /v1/hook` requests for any handle bound to that `push_key`, causing the relay to deliver content-free wake pushes to those registered devices up to `RATE_LIMIT_PER_MINUTE` (wake spam / battery drain) and refreshing those handles' inactivity timers while valid signed webhooks keep arriving.
+- **Does NOT allow:** Reading message contents, learning Pubky identities, reading stored device tokens, triggering handles bound to any other `push_key`, or redirecting existing handles to different tokens.
+- **Recovery:** Rotating the `push_key` in Pubky Dispatch stops the Dispatch server from using the old key and binds future registrations to the new key. Existing handles already stored in this relay remain bound to the compromised `push_key` until they expire (if the attacker stops sending signed webhooks) or the relay operator explicitly deletes rows matching that `push_key` from the relay database (`DELETE FROM registrations WHERE push_key = ...`).
 
 ### What a stolen relay database allows
 

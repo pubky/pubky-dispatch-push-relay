@@ -156,14 +156,17 @@ impl PushSender for RecordingSender {
         })
     }
 
-    fn check_ready(&self) -> Result<(), PushError> {
-        if self.ready.load(Ordering::Relaxed) {
-            Ok(())
-        } else {
-            Err(PushError::Auth {
-                class: UpstreamErrorClass::Auth,
-            })
-        }
+    fn check_ready(&self) -> BoxFuture<'_, Result<(), PushError>> {
+        let ready = self.ready.load(Ordering::Relaxed);
+        Box::pin(async move {
+            if ready {
+                Ok(())
+            } else {
+                Err(PushError::Auth {
+                    class: UpstreamErrorClass::Auth,
+                })
+            }
+        })
     }
 }
 

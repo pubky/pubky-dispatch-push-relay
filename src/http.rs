@@ -89,9 +89,10 @@ impl RelayState {
         clock: Arc<dyn Clock>,
         settings: RelaySettings,
     ) -> Self {
-        let replay: Arc<dyn ReplayStore> = Arc::new(NonceCache::new(
+        let replay: Arc<dyn ReplayStore> = Arc::new(NonceCache::with_limits(
             NONCE_TTL_MS,
             settings.nonce_cache_max_entries,
+            settings.max_nonces_per_handle,
         ));
         let limiters = Self::in_memory_limiters(&settings);
         Self::with_backends(store, push, clock, replay, limiters, settings)
@@ -172,8 +173,11 @@ impl RelayState {
                 tracing::warn!(scope = name, error = %err, "failed to prune rate limits");
             }
         }
-        let cutoff_ms = wall_now_ms.saturating_sub(self.settings.registration_ttl_ms);
-        let evicted_registrations = match self.store.prune_expired(cutoff_ms).await {
+        let evicted_registrations = match self
+            .store
+            .prune_expired(wall_now_ms, self.settings.registration_ttl_ms)
+            .await
+        {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to prune inactive registrations");
@@ -317,7 +321,7 @@ async fn handle_readiness(State(state): State<RelayState>) -> (StatusCode, Json<
             }),
         );
     }
-    if let Err(err) = state.push.check_ready() {
+    if let Err(err) = state.push.check_ready().await {
         tracing::error!(
             class = err.log_class(),
             "readiness check failed: push provider credentials not ready"
@@ -352,7 +356,33 @@ async fn handle_register(
     let wall_now_ms = state.clock.now_ms();
     let mono_now_ms = state.clock.monotonic_ms();
 
-    // 1. Per-client-IP rate limit first so one abusive IP cannot burn the global quota.
+    // 0. Check global registration rate limit (read-only) BEFORE creating any per-IP or
+    //    per-key bucket rows so distributed floods cannot grow rate_limit_buckets unboundedly.
+    match state
+        .register_global_limiter
+        .is_limited("register", mono_now_ms)
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(retry_after)) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::RateLimitedGlobal);
+            return Err(ApiError::rate_limited_with_message(
+                retry_after,
+                "global registration rate limit exceeded",
+            ));
+        }
+        Err(err) => {
+            state
+                .metrics
+                .inc_registration(RegistrationOutcome::InternalError);
+            tracing::error!(error = %err, "global registration rate-limit peek failed");
+            return Err(ApiError::internal());
+        }
+    }
+
+    // 1. Per-client-IP rate limit so one abusive IP cannot burn the global quota.
     let peer_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -620,12 +650,20 @@ async fn handle_hook(
 
     let wall_now_ms = state.clock.now_ms();
     let mono_now_ms = state.clock.monotonic_ms();
-    let active_cutoff_ms = wall_now_ms.saturating_sub(state.settings.registration_ttl_ms);
 
     // Rule 2 (Wire Format §8.3): handle must be known and not expired (else 404).
+    // Handles containing NUL bytes cannot exist in storage (and PostgreSQL rejects NUL in TEXT).
+    if webhook.handle.contains('\0') {
+        state.metrics.inc_webhook(WebhookOutcome::UnknownHandle);
+        return Err(ApiError::not_found("unknown push handle"));
+    }
     let registration = match state
         .store
-        .get_active(&webhook.handle, active_cutoff_ms)
+        .get_active(
+            &webhook.handle,
+            wall_now_ms,
+            state.settings.registration_ttl_ms,
+        )
         .await
     {
         Ok(Some(reg)) => reg,
@@ -673,16 +711,23 @@ async fn handle_hook(
         ));
     }
 
-    // Rule 5 (Wire Format §8.3): nonce unseen in the last 10 minutes (else 409; 503 if full).
+    // Rule 5 (Wire Format §8.3): atomically check and record the nonce BEFORE the per-minute
+    // rate limit so a rate-rejected signed webhook is remembered and cannot be replayed once
+    // the minute resets, while the per-handle active-nonce cap isolates shared replay storage.
     match state
         .replay
-        .check_and_record(nonce, wall_now_ms, mono_now_ms)
+        .check_and_record(&webhook.handle, nonce, wall_now_ms, mono_now_ms)
         .await
     {
         Ok(true) => {}
         Ok(false) => {
             state.metrics.inc_webhook(WebhookOutcome::NonceReplay);
             return Err(ApiError::nonce_replay());
+        }
+        Err(ReplayError::HandleCapacityExceeded) => {
+            state.metrics.inc_webhook(WebhookOutcome::RateLimited);
+            tracing::warn!("handle reached live-nonce capacity; throttling webhook");
+            return Err(ApiError::rate_limited(60));
         }
         Err(ReplayError::CapacityExceeded) => {
             state
@@ -695,7 +740,7 @@ async fn handle_hook(
         }
         Err(ReplayError::Backend(err)) => {
             state.metrics.inc_webhook(WebhookOutcome::InternalError);
-            tracing::error!(error = %err, "replay cache lookup failed on webhook");
+            tracing::error!(error = %err, "replay cache record failed on webhook");
             return Err(ApiError::internal());
         }
     }
@@ -760,21 +805,56 @@ async fn handle_hook(
                 }),
             ))
         }
-        Ok(Ok(PushOutcome::InvalidToken { class })) => {
+        Ok(Ok(PushOutcome::InvalidToken {
+            class,
+            invalidated_at_ms,
+        })) => {
+            let delete_result = match invalidated_at_ms {
+                Some(ts_ms) => {
+                    state
+                        .store
+                        .delete_if_not_newer_than(&registration.handle, ts_ms)
+                        .await
+                }
+                None => state.store.delete(&registration.handle).await,
+            };
+            let deleted = match delete_result {
+                Ok(deleted) => deleted,
+                Err(err) => {
+                    state.metrics.inc_webhook(WebhookOutcome::InternalError);
+                    tracing::error!(
+                        platform = %registration.platform,
+                        error = %err,
+                        "failed to delete handle after invalid device token"
+                    );
+                    return Err(ApiError::internal());
+                }
+            };
+
+            if invalidated_at_ms.is_some() && !deleted {
+                // Stale provider invalidation (for example an APNs 410 whose timestamp is
+                // older than a fresh re-registration): preserve the handle and return 502.
+                state.metrics.inc_webhook(WebhookOutcome::UpstreamFailure);
+                state.metrics.observe_provider_latency(
+                    registration.platform,
+                    ProviderCallOutcome::Error,
+                    elapsed,
+                );
+                tracing::info!(
+                    platform = %registration.platform,
+                    class = %class.as_str(),
+                    "preserved handle: provider invalidation timestamp predates renewal"
+                );
+                return Err(ApiError::upstream(
+                    "stale provider invalidation superseded by newer registration",
+                ));
+            }
+
             state.metrics.observe_provider_latency(
                 registration.platform,
                 ProviderCallOutcome::Pruned,
                 elapsed,
             );
-            if let Err(err) = state.store.delete(&registration.handle).await {
-                state.metrics.inc_webhook(WebhookOutcome::InternalError);
-                tracing::error!(
-                    platform = %registration.platform,
-                    error = %err,
-                    "failed to delete handle after invalid device token"
-                );
-                return Err(ApiError::internal());
-            }
             if let Err(err) = state.rate_limiter.remove_key(&registration.handle).await {
                 tracing::warn!(
                     platform = %registration.platform,

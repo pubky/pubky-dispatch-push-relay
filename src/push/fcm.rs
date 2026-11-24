@@ -9,7 +9,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use reqwest::Client;
 use ring::rand::SystemRandom;
-use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+use ring::signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
@@ -37,8 +37,11 @@ pub const FCM_COLLAPSE_KEY: &str = "pubky-dispatch-wake";
 /// Refresh cached OAuth2 access tokens this many seconds before expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 120;
 
-/// Minimum RSA modulus length in bytes (2048 bits) required by `ring` and RS256 best practices.
-const MIN_RSA_MODULUS_BYTES: usize = 256;
+/// Minimum RSA modulus length in bits (2048 bits) required by RS256 best practices.
+const MIN_RSA_MODULUS_BITS: usize = 2048;
+
+/// Protobuf `@type` URL identifying typed Firebase Cloud Messaging v1 error details.
+const FCM_ERROR_DETAIL_TYPE: &str = "type.googleapis.com/google.firebase.fcm.v1.FcmError";
 
 /// Google service account credentials JSON structure.
 #[derive(Clone, Deserialize)]
@@ -164,6 +167,8 @@ struct FcmErrorBody {
 
 #[derive(Deserialize)]
 struct FcmErrorDetail {
+    #[serde(rename = "@type")]
+    detail_type: Option<String>,
     #[serde(rename = "errorCode")]
     error_code: Option<String>,
 }
@@ -223,12 +228,16 @@ impl FcmSender {
         }
 
         let key_pair = parse_rsa_pem(sa.private_key.as_str())?;
-        let modulus_len = key_pair.public().modulus_len();
-        if modulus_len < MIN_RSA_MODULUS_BYTES {
-            return Err(PushError::Config(
-                "FCM service account RSA key must be at least 2048 bits".to_owned(),
-            ));
+        let modulus_bits =
+            rsa_public_key_modulus_bits(key_pair.public_key().as_ref()).ok_or_else(|| {
+                PushError::Config("failed to inspect FCM service account RSA modulus".to_owned())
+            })?;
+        if modulus_bits < MIN_RSA_MODULUS_BITS {
+            return Err(PushError::Config(format!(
+                "FCM service account RSA key must be at least {MIN_RSA_MODULUS_BITS} bits (got {modulus_bits} bits)"
+            )));
         }
+        let modulus_len = key_pair.public().modulus_len();
 
         let rng = SystemRandom::new();
         let mut probe_sig = vec![0u8; modulus_len];
@@ -351,7 +360,8 @@ impl FcmSender {
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
-            if matches!(status_code, 429 | 503)
+            // OAuth token exchange throttling / server unavailability is provider-wide.
+            if matches!(status_code, 429 | 500 | 503)
                 && let Some(delay_ms) =
                     parse_retry_after_ms(response.headers(), self.clock.now_ms())
             {
@@ -466,19 +476,21 @@ impl FcmSender {
             return Ok(FcmResponse::Unauthorized { generation });
         }
 
-        if matches!(status_code, 429 | 503)
+        // Only trigger provider-wide backoff on server-wide 500/503 responses.
+        // HTTP 429 on /messages:send (QUOTA_EXCEEDED) can be device-scoped and must not
+        // pause delivery to unrelated devices.
+        if matches!(status_code, 500 | 503)
             && let Some(delay_ms) = parse_retry_after_ms(response.headers(), self.clock.now_ms())
         {
             self.backoff.record(self.clock.monotonic_ms(), delay_ms);
         }
 
-        if status_code == 403 {
-            self.auth_healthy.store(false, Ordering::Relaxed);
-        }
-
         let body_bytes = response.bytes().await.unwrap_or_default();
         if let Some(class) = classify_invalid_fcm_token(status_code, &body_bytes) {
-            return Ok(FcmResponse::Outcome(PushOutcome::InvalidToken { class }));
+            return Ok(FcmResponse::Outcome(PushOutcome::InvalidToken {
+                class,
+                invalidated_at_ms: None,
+            }));
         }
 
         Err(PushError::Upstream {
@@ -547,27 +559,72 @@ fn parse_rsa_pem(pem: &str) -> Result<RsaKeyPair, PushError> {
     })
 }
 
-/// Requires explicit token-specific FCM evidence before deleting a handle:
-/// - `error.details` contains an `FcmError` with `errorCode == "UNREGISTERED"`
+fn der_read_tlv(input: &[u8], expected_tag: u8) -> Option<(&[u8], &[u8])> {
+    if *input.first()? != expected_tag {
+        return None;
+    }
+    let len_byte = *input.get(1)?;
+    let (len, hdr_len) = if len_byte < 0x80 {
+        (usize::from(len_byte), 2usize)
+    } else {
+        let num_octets = usize::from(len_byte & 0x7f);
+        if num_octets == 0 || num_octets > 4 || input.len() < 2 + num_octets {
+            return None;
+        }
+        let mut len = 0usize;
+        for &b in &input[2..2 + num_octets] {
+            len = (len << 8) | usize::from(b);
+        }
+        (len, 2 + num_octets)
+    };
+    let end = hdr_len.checked_add(len)?;
+    if end > input.len() {
+        return None;
+    }
+    Some((&input[hdr_len..end], &input[end..]))
+}
+
+/// Extracts the exact RSA modulus bit length from a DER-encoded `RSAPublicKey`
+/// (`SEQUENCE { INTEGER modulus, INTEGER publicExponent }`).
+fn rsa_public_key_modulus_bits(public_key_der: &[u8]) -> Option<usize> {
+    let (seq_body, trailing) = der_read_tlv(public_key_der, 0x30)?;
+    if !trailing.is_empty() {
+        return None;
+    }
+    let (modulus_bytes, _) = der_read_tlv(seq_body, 0x02)?;
+    let trimmed = modulus_bytes
+        .iter()
+        .position(|&b| b != 0)
+        .map_or(&[][..], |idx| &modulus_bytes[idx..]);
+    let (&first, rest) = trimmed.split_first()?;
+    let leading_bits = 8usize.saturating_sub(first.leading_zeros() as usize);
+    Some(rest.len().saturating_mul(8).saturating_add(leading_bits))
+}
+
+/// Requires explicit, typed token-specific FCM evidence before deleting a handle:
+/// - `error.details` contains a typed `type.googleapis.com/google.firebase.fcm.v1.FcmError`
+///   entry with `errorCode == "UNREGISTERED"`
 /// - `400 INVALID_ARGUMENT` whose message explicitly names the registration token
 ///
-/// Generic HTTP 404 or `NOT_FOUND` responses without `errorCode: "UNREGISTERED"` (such as
-/// misconfigured project IDs or upstream proxy errors) MUST NOT delete a healthy handle.
+/// Generic HTTP 404 / `NOT_FOUND`, untyped `UNREGISTERED` details, and non-token
+/// `INVALID_ARGUMENT` responses MUST NOT delete a healthy handle.
 fn classify_invalid_fcm_token(status: u16, body: &[u8]) -> Option<InvalidTokenClass> {
     let envelope = serde_json::from_slice::<FcmErrorEnvelope>(body).ok()?;
     let err = envelope.error?;
 
     for detail in &err.details {
-        if detail.error_code.as_deref() == Some("UNREGISTERED") {
+        if detail.detail_type.as_deref() == Some(FCM_ERROR_DETAIL_TYPE)
+            && detail.error_code.as_deref() == Some("UNREGISTERED")
+        {
             return Some(InvalidTokenClass::FcmUnregistered);
         }
     }
 
     let is_invalid_argument = err.status.as_deref() == Some("INVALID_ARGUMENT")
-        || err
-            .details
-            .iter()
-            .any(|d| d.error_code.as_deref() == Some("INVALID_ARGUMENT"));
+        || err.details.iter().any(|d| {
+            d.detail_type.as_deref() == Some(FCM_ERROR_DETAIL_TYPE)
+                && d.error_code.as_deref() == Some("INVALID_ARGUMENT")
+        });
     if status == 400
         && is_invalid_argument
         && err
@@ -593,7 +650,10 @@ impl PushSender for FcmSender {
                     self.invalidate_access_token_if_generation(generation).await;
                     match self.send_once(registration).await? {
                         FcmResponse::Outcome(outcome) => Ok(outcome),
-                        FcmResponse::Unauthorized { .. } => {
+                        FcmResponse::Unauthorized {
+                            generation: retry_gen,
+                        } => {
+                            self.invalidate_access_token_if_generation(retry_gen).await;
                             self.auth_healthy.store(false, Ordering::Relaxed);
                             Err(PushError::Auth {
                                 class: UpstreamErrorClass::Auth,
@@ -605,14 +665,16 @@ impl PushSender for FcmSender {
         })
     }
 
-    fn check_ready(&self) -> Result<(), PushError> {
-        if !self.auth_healthy.load(Ordering::Relaxed) {
-            return Err(PushError::Auth {
-                class: UpstreamErrorClass::Auth,
-            });
-        }
-        self.build_jwt_assertion(self.clock.now_ms() / 1_000)
-            .map(|_| ())
+    fn check_ready(&self) -> BoxFuture<'_, Result<(), PushError>> {
+        Box::pin(async move {
+            self.build_jwt_assertion(self.clock.now_ms() / 1_000)?;
+            if !self.auth_healthy.load(Ordering::Relaxed) {
+                // Probe OAuth token exchange so a drained replica recovers cleanly once
+                // provider credential issues clear without needing delivery traffic.
+                self.access_token().await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -639,6 +701,38 @@ HbPtvmny0Cbd0bxjgjFW8wv3lebTtDTaJD3kbcsqcRu7K1dcXTfYBosNqWwNkHKs
 QYdbWZeUcYGQqAY=
 -----END PRIVATE KEY-----";
 
+    /// Test-only 2047-bit RSA key (256 bytes with leading byte < 0x80) used to verify exact
+    /// 2048-bit minimum enforcement at startup.
+    const TEST_UNDERSIZED_RSA_2047_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAEx9r+2rETWev9Ao
+Na8jhZ12NJMaQn9T/3MSdeKhV0CQ9kGc8uXGCK15Db1POMQXZMy59EU7vS8Q3xth
+sTmjrqc4rqaMInvnlN0plW5sEk4uFUkj5KDfPKax8NHTIGclJ4g92b5n57tn4+7V
+gq3Wb+hCaybtCMmzwslI5Kj6Qw3iU9MLbfkGv+hc3p/mM+obaEejwt3R0s0Npt9F
+xAvOfuA40nfrKFKvlGPo2zo0ajUNVOPVfitqS0s2bGROYpxDTRvLcHGFFNGgsnj+
+ALF8atV0in4tbVg4FJ9PsWhF2X6FnF2K/E9SET1AZIpjm4OimEHQOvCfghD78j6F
+tHKApz8CAwEAAQKCAQANwmo8OZKN77GXczQ8/gnSCmpor8eYefawr3hvPRCh97Gk
+meQDuzziX60+CZsvgvnJ7gVn0tg0ODe6CDfGI5COWh7orLqjSUQ5CHrt8xjT4WxI
+zOEaoy2Y2td0FyN0CnXzBxU9MBm6V3TkCJpKRRG6WQBHb0ouZly6spcXYnVfcMsp
+BftLFdRrzrXFuyfayZpHzyx1G9taSjbAxqM0kr7O84W9vUD12ODKRskl5tMrEhdM
+WdL4krI+tfVcp7F8aVvT+7XOlAPqI+0y0tsbGbow3lYem2unRk+a+rg8ui28D5q5
+p/siuBe05icCxkRCC7t3Fy9sWGOP1FVQEGVoBdHBAoGBAMDUQBJxQZcYmmwN5jGH
+4ZQt6IwS/teRaJ6TmuB9GZMw/S0gSc9l7+iTglZQ5Vov5M4Xev1QB99M3DBUlwz4
+B/SF9l0JLBzmwmar1D7hHGZC/7FxrFexAp0aNMaiwOrMettibwboFdeT4so4fan6
+g/aRnS0UIfwdSQJKbnIpY8GhAoGAZYyoCrSALltXfOAca/bKg+Ayr17T7URXEvU7
+k9CXceQJfZN/wrJ3/040oVfiDQwlG/jHs67787RXwewJdUzJytJBATQ8KdZUSfYH
+pOPsHiO9uWOtyloDIjz7Z1d6wnpsEGjG8sKxzbc5FHKS0THpaxmn5GrQx/umJN1c
+hSMxfN8CgYBHJcliRKGT04MevV4jBmToHKxCCrw247L7V7D8hYwLMDcqEFDLkmwb
+n1mm6YBGb4d3t1gs4PuWm7BesMdvBJFC2q7VEw5Qt6Ag6+OLM9obrTrUyQFy9Z/m
+QYYZiHGv8LSf/8jBfp6YhTtXq9JKBmHsdzvMJzKG6HNIwhfQTY8+IQKBgCbD7Ro5
+EX2gzOMUwoTMbz6shWzA7HH01rCcASRKSqXlgWH4vpraekhx2FGHNPn6Guh0rfd/
+4xqDS8TxkCLBL39HiB0njZgDA6ZAT2a4w1g2GKT+0kce2XdmhCpNEMXQ6hPRi7D8
+ddesDBQsMLO/M/X4k0j1JcJR5HjKMBl699dNAoGBAKvWyd8OytNGtP5wr1n94nwh
+LGsosuiinlexQg05D4b9dv/n4qsgGCnfSFn6f14IS7i1e7HRfwbI613GOfz5i/On
+igWqs1q23JbnaCCk9sM1kr0wa98e5et6m5moPBycDqavy+iY/jo8FBxjV4ZbE8MD
+kadWJGam6nLOthuqBlX3
+-----END PRIVATE KEY-----";
+
     #[test]
     fn service_account_debug_redacts_private_key() {
         let sa = FcmServiceAccount {
@@ -654,14 +748,20 @@ QYdbWZeUcYGQqAY=
 
     #[test]
     fn rejects_undersized_rsa_key_at_startup_without_panicking() {
-        let cfg = FcmConfig::new(FcmServiceAccount {
-            project_id: "demo-project".to_owned(),
-            client_email: "push@demo-project.iam.gserviceaccount.com".to_owned(),
-            private_key: Zeroizing::new(TEST_UNDERSIZED_RSA_1024_PEM.to_owned()),
-            token_uri: None,
-        });
-        let err = FcmSender::new(cfg).expect_err("1024-bit RSA key must fail at startup");
-        assert!(matches!(err, PushError::Config(_)));
+        for (bits, pem) in [
+            (1024, TEST_UNDERSIZED_RSA_1024_PEM),
+            (2047, TEST_UNDERSIZED_RSA_2047_PEM),
+        ] {
+            let cfg = FcmConfig::new(FcmServiceAccount {
+                project_id: "demo-project".to_owned(),
+                client_email: "push@demo-project.iam.gserviceaccount.com".to_owned(),
+                private_key: Zeroizing::new(pem.to_owned()),
+                token_uri: None,
+            });
+            let err =
+                FcmSender::new(cfg).expect_err(&format!("{bits}-bit RSA key must fail at startup"));
+            assert!(matches!(err, PushError::Config(_)));
+        }
     }
 
     #[test]
@@ -692,6 +792,34 @@ QYdbWZeUcYGQqAY=
         assert_eq!(
             classify_invalid_fcm_token(400, invalid_token),
             Some(InvalidTokenClass::FcmInvalidRegistrationToken)
+        );
+
+        // Untyped UNREGISTERED detail or wrong @type must NOT prune healthy registrations.
+        let untyped_unregistered = br#"{
+            "error": {
+                "code": 404,
+                "message": "Requested entity was not found.",
+                "status": "NOT_FOUND",
+                "details": [{
+                    "errorCode": "UNREGISTERED"
+                }]
+            }
+        }"#;
+        assert_eq!(classify_invalid_fcm_token(404, untyped_unregistered), None);
+
+        let wrong_type_unregistered = br#"{
+            "error": {
+                "code": 404,
+                "status": "NOT_FOUND",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "errorCode": "UNREGISTERED"
+                }]
+            }
+        }"#;
+        assert_eq!(
+            classify_invalid_fcm_token(404, wrong_type_unregistered),
+            None
         );
 
         // Generic 404 / NOT_FOUND without UNREGISTERED must NOT prune healthy registrations.

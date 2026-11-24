@@ -31,6 +31,16 @@ pub enum RateLimitError {
 /// multi-replica PostgreSQL deployments share a durable table via
 /// [`crate::store::postgres::PostgresRateLimitStore`].
 pub trait RateLimitStore: Send + Sync {
+    /// Read-only check returning `Ok(Some(retry_after_secs))` if `key` is already at or
+    /// above its window limit at `now_ms`, or `Ok(None)` if a slot is available.
+    ///
+    /// Never creates a bucket row or consumes a slot.
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<Option<u64>, RateLimitError>>;
+
     /// Atomically attempts to consume one slot for `key` at `now_ms`.
     ///
     /// Returns `Ok(Ok(()))` if permitted, `Ok(Err(retry_after_secs))` (`>= 1`) when
@@ -91,6 +101,36 @@ impl RateLimiter {
             state: Mutex::new(LimiterState {
                 buckets: HashMap::new(),
             }),
+        }
+    }
+
+    /// Read-only check returning `Some(retry_after_secs)` if `handle` is currently at its
+    /// sliding-window limit at `now_ms`, without allocating or mutating bucket state.
+    #[must_use]
+    pub fn is_limited(&self, handle: &str, now_ms: u64) -> Option<u64> {
+        if self.max_per_window == 0 {
+            return Some(self.window_ms.div_ceil(1_000).max(1));
+        }
+
+        let state = self.state.lock();
+        let bucket = state.buckets.get(handle)?;
+        let window_ms = self.window_ms;
+        let mut active_count = 0usize;
+        let mut oldest: Option<u64> = None;
+        for &ts in bucket {
+            if now_ms.saturating_sub(ts) < window_ms {
+                active_count += 1;
+                if oldest.is_none() {
+                    oldest = Some(ts);
+                }
+            }
+        }
+        if active_count >= self.max_per_window {
+            let oldest_ms = oldest.unwrap_or(now_ms);
+            let wait_ms = oldest_ms.saturating_add(window_ms).saturating_sub(now_ms);
+            Some(wait_ms.div_ceil(1_000).max(1))
+        } else {
+            None
         }
     }
 
@@ -169,6 +209,14 @@ impl RateLimiter {
 }
 
 impl RateLimitStore for RateLimiter {
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<Option<u64>, RateLimitError>> {
+        Box::pin(async move { Ok(Self::is_limited(self, key, now_ms)) })
+    }
+
     fn check_and_record<'a>(
         &'a self,
         key: &'a str,

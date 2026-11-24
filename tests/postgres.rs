@@ -28,13 +28,14 @@ use pubky_dispatch_push_relay::crypto::{
 use pubky_dispatch_push_relay::http::{RateLimitBackends, RelayState, router};
 use pubky_dispatch_push_relay::push::noop::RecordingSender;
 use pubky_dispatch_push_relay::push::{InvalidTokenClass, PushOutcome};
-use pubky_dispatch_push_relay::rate_limit::RateLimitStore;
-use pubky_dispatch_push_relay::replay::{ReplayError, ReplayStore};
+use pubky_dispatch_push_relay::rate_limit::{RATE_WINDOW_MS, RateLimitStore};
+use pubky_dispatch_push_relay::replay::{NONCE_TTL_MS, ReplayError, ReplayStore};
 use pubky_dispatch_push_relay::store::postgres::{
     PostgresRateLimitStore, PostgresReplayStore, PostgresStore,
 };
 use pubky_dispatch_push_relay::store::{
-    ApnsEnv, Platform, Registration, RegistrationStore, StoreError,
+    ApnsEnv, Platform, RegisterOutcome, Registration, RegistrationLimits, RegistrationStore,
+    StoreError,
 };
 use pubky_dispatch_push_relay::time::format_rfc3339;
 
@@ -250,9 +251,9 @@ async fn postgres_replay_table_is_durable_bounded_and_uses_database_time() {
         return;
     };
 
-    // Short 400 ms TTL with live cap = 2 to test durability, cap, and DB-clock expiry.
+    // Short 400 ms TTL with global cap = 2 and per-handle cap = 2 to test durability, caps, and DB-clock expiry.
     let replay = Arc::new(
-        PostgresReplayStore::with_ttl(schema.pool.clone(), 400, 2)
+        PostgresReplayStore::with_limits(schema.pool.clone(), 400, 2, 2)
             .await
             .unwrap(),
     );
@@ -276,7 +277,10 @@ async fn postgres_replay_table_is_durable_bounded_and_uses_database_time() {
     for _ in 0..10 {
         let replay = replay.clone();
         tasks.push(tokio::spawn(async move {
-            replay.check_and_record(nonce, 0, 0).await.unwrap()
+            replay
+                .check_and_record("handle-a", nonce, 0, 0)
+                .await
+                .unwrap()
         }));
     }
     let mut accepted = 0usize;
@@ -287,14 +291,26 @@ async fn postgres_replay_table_is_durable_bounded_and_uses_database_time() {
     }
     assert_eq!(accepted, 1);
 
-    // Fill second slot -> third fresh nonce returns CapacityExceeded (503), never evicting live nonces.
-    assert!(replay.check_and_record([0xCD; 16], 0, 0).await.unwrap());
+    // Fill second slot on handle-b -> third fresh nonce on handle-c returns CapacityExceeded (503).
+    assert!(
+        replay
+            .check_and_record("handle-b", [0xCD; 16], 0, 0)
+            .await
+            .unwrap()
+    );
     assert!(matches!(
-        replay.check_and_record([0xEF; 16], 0, 0).await,
+        replay.check_and_record("handle-c", [0xEF; 16], 0, 0).await,
         Err(ReplayError::CapacityExceeded)
     ));
     // Live nonce still rejected as replay (409) even while at capacity.
-    assert!(!replay.check_and_record(nonce, 0, 0).await.unwrap());
+    assert!(!replay.contains_live([0xEF; 16], 0, 0).await.unwrap());
+    assert!(replay.contains_live(nonce, 0, 0).await.unwrap());
+    assert!(
+        !replay
+            .check_and_record("handle-a", nonce, 0, 0)
+            .await
+            .unwrap()
+    );
 
     // A skewed replica claiming a far-future wall clock (+1 hour) CANNOT prune live nonces!
     let far_future = SystemClock.now_ms() + 3_600_000;
@@ -304,14 +320,65 @@ async fn postgres_replay_table_is_durable_bounded_and_uses_database_time() {
     );
     assert!(
         !replay
-            .check_and_record(nonce, far_future, far_future)
+            .check_and_record("handle-a", nonce, far_future, far_future)
             .await
             .unwrap()
     );
 
-    // After the real DB 400 ms TTL elapses, the expired row is pruned cleanly.
+    // After the real DB 400 ms TTL elapses, renewing an expired nonce persists cleanly and
+    // respects the global cap even if other slots are full!
     tokio::time::sleep(Duration::from_millis(450)).await;
-    assert_eq!(replay.prune_expired(0, 0).await.unwrap(), 2);
+    assert!(
+        replay
+            .check_and_record("handle-a", nonce, 0, 0)
+            .await
+            .unwrap(),
+        "expired nonce should renew cleanly"
+    );
+    assert!(
+        !replay
+            .check_and_record("handle-a", nonce, 0, 0)
+            .await
+            .unwrap(),
+        "renewed nonce must be durably stored and reject immediate replay"
+    );
+    assert!(
+        replay
+            .check_and_record("handle-b", [0x11; 16], 0, 0)
+            .await
+            .unwrap()
+    );
+    // [0xCD; 16] is still an expired row in webhook_nonces, but global cap (2) is full -> MUST fail closed!
+    assert!(matches!(
+        replay.check_and_record("handle-c", [0xCD; 16], 0, 0).await,
+        Err(ReplayError::CapacityExceeded)
+    ));
+
+    // Per-handle active-nonce cap isolates noisy handles from unrelated handles.
+    let per_handle = PostgresReplayStore::with_limits(schema.pool.clone(), 400, 10, 1)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(per_handle.prune_expired(0, 0).await.unwrap() >= 2);
+    assert!(
+        per_handle
+            .check_and_record("noisy", [0x21; 16], 0, 0)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        per_handle.check_and_record("noisy", [0x22; 16], 0, 0).await,
+        Err(ReplayError::HandleCapacityExceeded)
+    ));
+    assert!(
+        per_handle
+            .check_and_record("healthy", [0x23; 16], 0, 0)
+            .await
+            .unwrap()
+    );
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(per_handle.prune_expired(0, 0).await.unwrap(), 2);
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_nonces")
         .fetch_one(&schema.pool)
         .await
@@ -419,39 +486,56 @@ async fn multi_replica_http_routers_share_state_and_tolerate_replica_clock_skew(
     let build_replica = |pool: PgPool, clock: Arc<FixedClock>, settings: RelaySettings| async move {
         let store = Arc::new(PostgresStore::from_pool(pool.clone()).await.unwrap());
         let replay: Arc<dyn ReplayStore> = Arc::new(
-            PostgresReplayStore::new(pool.clone(), settings.nonce_cache_max_entries)
-                .await
-                .unwrap(),
+            PostgresReplayStore::with_limits(
+                pool.clone(),
+                NONCE_TTL_MS,
+                settings.nonce_cache_max_entries,
+                settings.max_nonces_per_handle,
+            )
+            .await
+            .unwrap(),
         );
         let limiters = RateLimitBackends {
             hook_per_handle: Arc::new(
-                PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
-                    .await
-                    .unwrap(),
+                PostgresRateLimitStore::with_limits(
+                    pool.clone(),
+                    "hook",
+                    RATE_WINDOW_MS,
+                    settings.rate_limit_per_minute,
+                    settings.rate_limit_max_handles,
+                )
+                .await
+                .unwrap(),
             ),
             register_per_ip: Arc::new(
-                PostgresRateLimitStore::new(
+                PostgresRateLimitStore::with_limits(
                     pool.clone(),
                     "register_ip",
+                    RATE_WINDOW_MS,
                     settings.register_ip_rate_limit_per_minute,
+                    settings.rate_limit_max_handles,
                 )
                 .await
                 .unwrap(),
             ),
             register_per_key: Arc::new(
-                PostgresRateLimitStore::new(
+                PostgresRateLimitStore::with_limits(
                     pool.clone(),
                     "register_key",
+                    RATE_WINDOW_MS,
                     settings.register_key_rate_limit_per_minute,
+                    settings.rate_limit_max_handles,
                 )
                 .await
                 .unwrap(),
             ),
             register_global: Arc::new(
-                PostgresRateLimitStore::new(
+                PostgresRateLimitStore::with_limits(
                     pool,
                     "register_global",
+                    RATE_WINDOW_MS,
                     settings.register_rate_limit_per_minute,
+                    1,
                 )
                 .await
                 .unwrap(),
@@ -521,6 +605,7 @@ async fn multi_replica_http_routers_share_state_and_tolerate_replica_clock_skew(
         .unwrap();
     sender_b.enqueue_outcome(PushOutcome::InvalidToken {
         class: InvalidTokenClass::FcmUnregistered,
+        invalidated_at_ms: None,
     });
     let (s, _, b) = send_signed_hook(&replica_b, &push_key, &handle1, now, [5; 16]).await;
     assert_eq!(s, StatusCode::OK);
@@ -593,10 +678,13 @@ async fn postgres_versioned_migrations_are_recorded_idempotent_and_checksum_veri
     .fetch_all(&schema.pool)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "initial");
     assert_eq!(rows[0].2.len(), 64);
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[1].1, "replay_handle_hash");
+    assert_eq!(rows[1].2.len(), 64);
 
     // Second startup is idempotent.
     let _store2 = PostgresStore::from_pool(schema.pool.clone()).await.unwrap();
@@ -610,6 +698,286 @@ async fn postgres_versioned_migrations_are_recorded_idempotent_and_checksum_veri
         .await
         .unwrap_err();
     assert!(err.to_string().contains("checksum mismatch"));
+
+    schema.teardown().await;
+}
+
+#[tokio::test]
+async fn postgres_rate_limit_buckets_are_bounded_and_global_limit_prevents_bucket_growth() {
+    let Some(schema) = TestSchema::setup().await else {
+        return;
+    };
+
+    // 1. Per-scope max_buckets cap prevents unbounded table growth in rate_limit_buckets.
+    let bounded =
+        PostgresRateLimitStore::with_limits(schema.pool.clone(), "bounded_ip", 5_000, 5, 2)
+            .await
+            .unwrap();
+    assert_eq!(bounded.check_and_record("ip-1", 0).await.unwrap(), Ok(()));
+    assert_eq!(bounded.check_and_record("ip-2", 0).await.unwrap(), Ok(()));
+    assert!(bounded.check_and_record("ip-3", 0).await.unwrap().is_err());
+    let bounded_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_buckets WHERE scope = 'bounded_ip'")
+            .fetch_one(&schema.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        bounded_rows, 2,
+        "rate_limit_buckets must not exceed max_buckets"
+    );
+
+    // 2. On /v1/register, once global limit is saturated, fresh IPs and keys return 429
+    //    WITHOUT creating new rows in rate_limit_buckets.
+    let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    settings.register_rate_limit_per_minute = 2;
+    settings.register_ip_rate_limit_per_minute = 10;
+    settings.register_key_rate_limit_per_minute = 10;
+    let store = Arc::new(PostgresStore::from_pool(schema.pool.clone()).await.unwrap());
+    let replay: Arc<dyn ReplayStore> = Arc::new(
+        PostgresReplayStore::with_limits(
+            schema.pool.clone(),
+            NONCE_TTL_MS,
+            settings.nonce_cache_max_entries,
+            settings.max_nonces_per_handle,
+        )
+        .await
+        .unwrap(),
+    );
+    let limiters = RateLimitBackends {
+        hook_per_handle: Arc::new(
+            PostgresRateLimitStore::with_limits(
+                schema.pool.clone(),
+                "hook",
+                RATE_WINDOW_MS,
+                settings.rate_limit_per_minute,
+                100,
+            )
+            .await
+            .unwrap(),
+        ),
+        register_per_ip: Arc::new(
+            PostgresRateLimitStore::with_limits(
+                schema.pool.clone(),
+                "register_ip",
+                RATE_WINDOW_MS,
+                settings.register_ip_rate_limit_per_minute,
+                100,
+            )
+            .await
+            .unwrap(),
+        ),
+        register_per_key: Arc::new(
+            PostgresRateLimitStore::with_limits(
+                schema.pool.clone(),
+                "register_key",
+                RATE_WINDOW_MS,
+                settings.register_key_rate_limit_per_minute,
+                100,
+            )
+            .await
+            .unwrap(),
+        ),
+        register_global: Arc::new(
+            PostgresRateLimitStore::with_limits(
+                schema.pool.clone(),
+                "register_global",
+                RATE_WINDOW_MS,
+                settings.register_rate_limit_per_minute,
+                1,
+            )
+            .await
+            .unwrap(),
+        ),
+    };
+    let app = router(RelayState::with_backends(
+        store,
+        Arc::new(RecordingSender::new()),
+        Arc::new(FixedClock::new(SystemClock.now_ms())),
+        replay,
+        limiters,
+        settings,
+    ));
+
+    for i in 1u8..=2u8 {
+        let (s, _, _) = register_device_from(
+            &app,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)),
+            &format!("pg-tok-{i}"),
+            &SigningKey::from_bytes(&[i; 32]),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    let buckets_at_cap: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rate_limit_buckets WHERE scope IN ('register_ip', 'register_key')",
+    )
+    .fetch_one(&schema.pool)
+    .await
+    .unwrap();
+    assert_eq!(buckets_at_cap, 4);
+
+    for i in 3u8..8u8 {
+        let (s, _, b) = register_device_from(
+            &app,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)),
+            &format!("pg-tok-{i}"),
+            &SigningKey::from_bytes(&[i; 32]),
+        )
+        .await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(b["code"], "rate_limited");
+    }
+
+    let buckets_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rate_limit_buckets WHERE scope IN ('register_ip', 'register_key')",
+    )
+    .fetch_one(&schema.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        buckets_after, buckets_at_cap,
+        "global limit must reject before inserting per-IP or per-key rows"
+    );
+
+    schema.teardown().await;
+}
+
+#[tokio::test]
+async fn postgres_clock_timestamp_expiry_concurrent_prune_race_and_nul_handle() {
+    let Some(schema) = TestSchema::setup().await else {
+        return;
+    };
+
+    let store = Arc::new(PostgresStore::from_pool(schema.pool.clone()).await.unwrap());
+    let limits = RegistrationLimits {
+        max_registrations: 100,
+        max_handles_per_push_key: 10,
+        ttl_ms: 60_000,
+    };
+
+    // 1. PostgreSQL uses clock_timestamp() for registration expiry: a skewed replica
+    //    passing a far-future wall clock (+200 days) MUST NOT hide or prune an active handle.
+    let reg = Registration {
+        handle: "pg-clock-handle".to_owned(),
+        platform: Platform::Apns,
+        device_token: "aa".repeat(32),
+        push_key: [55u8; 32],
+        apns_env: Some(ApnsEnv::Production),
+        created_at_ms: 1,
+        last_active_at_ms: 1,
+    };
+    let handle = match store.register_or_get(&reg, limits, 1).await.unwrap() {
+        RegisterOutcome::Created(h) | RegisterOutcome::Existing(h) => h,
+    };
+    let skewed_future = SystemClock.now_ms() + 200 * 24 * 60 * 60 * 1_000;
+    assert!(
+        store
+            .get_active(&handle, skewed_future, limits.ttl_ms)
+            .await
+            .unwrap()
+            .is_some(),
+        "skewed replica clock must not treat active registration as expired"
+    );
+    assert_eq!(
+        store
+            .prune_expired(skewed_future, limits.ttl_ms)
+            .await
+            .unwrap(),
+        0,
+        "skewed replica clock must not prune active registration"
+    );
+
+    // 2. Conditional stale APNs 410 deletion: older timestamp preserves handle, newer deletes it.
+    let stored = store.get(&handle).await.unwrap().unwrap();
+    assert!(
+        !store
+            .delete_if_not_newer_than(&handle, stored.last_active_at_ms.saturating_sub(1))
+            .await
+            .unwrap()
+    );
+    assert!(store.get(&handle).await.unwrap().is_some());
+    assert!(
+        store
+            .delete_if_not_newer_than(&handle, stored.last_active_at_ms)
+            .await
+            .unwrap()
+    );
+    assert!(store.get(&handle).await.unwrap().is_none());
+
+    // 3. Concurrent prune during register_or_get renewal must NEVER return a deleted handle.
+    for iter in 0..10u8 {
+        let initial = Registration {
+            handle: format!("pg-race-init-{iter}"),
+            platform: Platform::Fcm,
+            device_token: format!("pg-race-tok-{iter}"),
+            push_key: [77u8; 32],
+            apns_env: None,
+            created_at_ms: 1,
+            last_active_at_ms: 1,
+        };
+        let h_init = match store.register_or_get(&initial, limits, 1).await.unwrap() {
+            RegisterOutcome::Created(h) | RegisterOutcome::Existing(h) => h,
+        };
+        // Force row into expired state so prune_expired and register_or_get race on it.
+        sqlx::query("UPDATE registrations SET last_active_at_ms = 1 WHERE handle = $1")
+            .bind(&h_init)
+            .execute(&schema.pool)
+            .await
+            .unwrap();
+
+        let fresh = Registration {
+            handle: format!("pg-race-fresh-{iter}"),
+            ..initial
+        };
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let (reg_res, prune_res) = tokio::join!(
+            async move { s1.register_or_get(&fresh, limits, 1).await },
+            async move { s2.prune_expired(0, limits.ttl_ms).await },
+        );
+        prune_res.unwrap();
+        let returned_handle = match reg_res.unwrap() {
+            RegisterOutcome::Created(h) | RegisterOutcome::Existing(h) => h,
+        };
+        assert!(
+            store.get(&returned_handle).await.unwrap().is_some(),
+            "register_or_get returned a handle that was concurrently pruned"
+        );
+    }
+
+    // 4. NUL-byte handle on /v1/hook returns 404 not_found (never PostgreSQL 500 error).
+    let settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    let replay: Arc<dyn ReplayStore> = Arc::new(
+        PostgresReplayStore::new(schema.pool.clone(), 100)
+            .await
+            .unwrap(),
+    );
+    let app = router(RelayState::with_backends(
+        store,
+        Arc::new(RecordingSender::new()),
+        Arc::new(FixedClock::new(SystemClock.now_ms())),
+        replay,
+        RelayState::in_memory_limiters(&settings),
+        settings,
+    ));
+    let nul_body = format!(
+        r#"{{"v":1,"handle":"bad\u0000handle","ts":"{}","nonce":"{}"}}"#,
+        format_rfc3339(SystemClock.now_ms()),
+        b64_encode(&[9u8; 16]),
+    );
+    let (s, _, b) = send_json(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/hook")
+            .header("content-type", "application/json")
+            .body(Body::from(nul_body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(b["code"], "not_found");
 
     schema.teardown().await;
 }

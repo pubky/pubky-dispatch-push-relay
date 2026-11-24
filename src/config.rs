@@ -21,7 +21,7 @@ use crate::push::apns::{ApnsConfig, ApnsPushMode};
 use crate::push::fcm::{FcmConfig, FcmServiceAccount};
 use crate::push::{DEFAULT_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS};
 use crate::rate_limit::{DEFAULT_MAX_TRACKED_HANDLES, DEFAULT_RATE_LIMIT_PER_MINUTE};
-use crate::replay::DEFAULT_MAX_NONCE_ENTRIES;
+use crate::replay::{DEFAULT_MAX_NONCE_ENTRIES, DEFAULT_MAX_NONCES_PER_HANDLE};
 use crate::store::{ApnsEnv, RegistrationLimits, is_postgres_url};
 
 /// Default SQLite database path used when `DATABASE_URL` is unset.
@@ -138,8 +138,10 @@ pub struct RelaySettings {
     pub max_registrations: u64,
     /// Inactivity expiry duration in milliseconds (default 90 days).
     pub registration_ttl_ms: u64,
-    /// Maximum live nonces retained in replay storage (refuses new webhooks with `503` when full).
+    /// Maximum live nonces retained globally in replay storage (refuses new webhooks with `503` when full).
     pub nonce_cache_max_entries: usize,
+    /// Maximum live nonces a single handle may hold simultaneously inside the 10-minute window.
+    pub max_nonces_per_handle: usize,
     /// Maximum simultaneously tracked keys in in-memory rate limiters.
     pub rate_limit_max_handles: usize,
     /// Maximum HTTP request body size in bytes (16 KiB).
@@ -179,6 +181,7 @@ impl RelaySettings {
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             registration_ttl_ms: DEFAULT_REGISTRATION_TTL_DAYS * MS_PER_DAY,
             nonce_cache_max_entries: DEFAULT_MAX_NONCE_ENTRIES,
+            max_nonces_per_handle: DEFAULT_MAX_NONCES_PER_HANDLE,
             rate_limit_max_handles: DEFAULT_MAX_TRACKED_HANDLES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             provider_timeout: Duration::from_millis(DEFAULT_PROVIDER_TIMEOUT_MS),
@@ -345,9 +348,17 @@ pub struct CliArgs {
     )]
     pub registration_ttl_days: u64,
 
-    /// Maximum live nonces retained in replay storage (refuses new webhooks with `503` when full).
+    /// Maximum live nonces retained globally in replay storage (refuses new webhooks with `503` when full).
     #[arg(long, env = "NONCE_CACHE_MAX_ENTRIES", default_value_t = DEFAULT_MAX_NONCE_ENTRIES)]
     pub nonce_cache_max_entries: usize,
+
+    /// Maximum live nonces a single handle may retain inside the 10-minute replay window.
+    #[arg(
+        long,
+        env = "MAX_NONCES_PER_HANDLE",
+        default_value_t = DEFAULT_MAX_NONCES_PER_HANDLE
+    )]
+    pub max_nonces_per_handle: usize,
 
     /// Upstream provider timeout in milliseconds (100..=4500, below Dispatch's 5 s timeout).
     #[arg(long, env = "PROVIDER_TIMEOUT_MS", default_value_t = DEFAULT_PROVIDER_TIMEOUT_MS)]
@@ -450,6 +461,7 @@ impl std::fmt::Debug for CliArgs {
             .field("max_registrations", &self.max_registrations)
             .field("registration_ttl_days", &self.registration_ttl_days)
             .field("nonce_cache_max_entries", &self.nonce_cache_max_entries)
+            .field("max_nonces_per_handle", &self.max_nonces_per_handle)
             .field("provider_timeout_ms", &self.provider_timeout_ms)
             .field("request_timeout_ms", &self.request_timeout_ms)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
@@ -484,6 +496,16 @@ impl CliArgs {
         if self.nonce_cache_max_entries == 0 {
             return Err(ConfigError::Invalid(
                 "NONCE_CACHE_MAX_ENTRIES must be >= 1".to_owned(),
+            ));
+        }
+        if self.max_nonces_per_handle == 0 {
+            return Err(ConfigError::Invalid(
+                "MAX_NONCES_PER_HANDLE must be >= 1".to_owned(),
+            ));
+        }
+        if self.max_nonces_per_handle > self.nonce_cache_max_entries {
+            return Err(ConfigError::Invalid(
+                "MAX_NONCES_PER_HANDLE must be <= NONCE_CACHE_MAX_ENTRIES".to_owned(),
             ));
         }
         if self.registration_ttl_days == 0 {
@@ -525,6 +547,7 @@ impl CliArgs {
         settings.max_registrations = self.max_registrations;
         settings.registration_ttl_ms = self.registration_ttl_days.saturating_mul(MS_PER_DAY);
         settings.nonce_cache_max_entries = self.nonce_cache_max_entries;
+        settings.max_nonces_per_handle = self.max_nonces_per_handle;
         settings.provider_timeout = Duration::from_millis(self.provider_timeout_ms);
         settings.request_timeout = Duration::from_millis(self.request_timeout_ms);
         settings.max_concurrent_requests = self.max_concurrent_requests;
@@ -752,6 +775,27 @@ mod tests {
     #[test]
     fn cli_help_never_prints_database_url_or_inline_secret_values() {
         let mut cmd = CliArgs::command();
+        // Directly verify clap's redaction attributes so removing `hide_env_values` or
+        // `hide_default_value` immediately fails even in a clean test environment.
+        for id in ["database_url", "apns_key_path", "fcm_service_account_path"] {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("expected CLI argument {id}"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "CLI argument {id} must set hide_env_values = true"
+            );
+        }
+        let db_arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "database_url")
+            .unwrap();
+        assert!(
+            db_arg.is_hide_default_value_set(),
+            "database_url must set hide_default_value = true"
+        );
+
         let help = cmd.render_long_help().to_string();
         // Inline secret flags must not exist as CLI flags at all.
         assert!(!help.contains("--apns-key-pem"));
@@ -797,6 +841,19 @@ mod tests {
         assert_eq!(settings.max_registrations, 50_000);
         assert_eq!(settings.provider_timeout, Duration::from_millis(3000));
         assert_eq!(ok.apns_push_mode, ApnsPushModeArg::Alert);
+
+        // Per-handle nonce cap must not exceed global nonce cache cap.
+        let bad_nonce_cap = CliArgs::try_parse_from([
+            "pubky-dispatch-push-relay",
+            "--relay-origin",
+            "https://push.example",
+            "--nonce-cache-max-entries",
+            "100",
+            "--max-nonces-per-handle",
+            "101",
+        ])
+        .unwrap();
+        assert!(bad_nonce_cap.to_relay_settings().is_err());
 
         // Provider timeout above 4500 ms is rejected (must stay below Dispatch's 5 s timeout).
         let bad_timeout = CliArgs::try_parse_from([
