@@ -1,7 +1,8 @@
 //! Wire Format encodings (`lp()`, strict base64url) and strict Ed25519 verification.
 //!
 //! Implements Wire Format §1.2 (base64url without padding), §1.4 (`lp()` length-prefixing),
-//! §2.1 (strict four-step Ed25519 verification), and §8.2 (push webhook signature input).
+//! §2.1 (strict four-step Ed25519 verification), and §8.2 (push webhook signature input and
+//! exact host-preserving relay origin derivation).
 
 use base64::Engine as _;
 use curve25519_dalek::{Scalar, edwards::CompressedEdwardsY};
@@ -35,7 +36,7 @@ pub enum CryptoError {
     /// Ed25519 signature failed strict Wire Format §2.1 verification.
     #[error("invalid Ed25519 signature: {0}")]
     InvalidSignature(&'static str),
-    /// Relay origin is not a canonical `https://<host>` origin without port or path.
+    /// Relay origin or URL does not satisfy Wire Format §8.2.
     #[error("invalid relay origin: {0}")]
     InvalidOrigin(&'static str),
     /// Operating system CSPRNG failed.
@@ -226,17 +227,49 @@ pub fn generate_handle() -> Result<String, CryptoError> {
     Ok(b64_encode(&raw))
 }
 
-/// Validates and normalizes a relay origin string (`https://<host>`, no port, path,
-/// query, fragment, or userinfo) per Wire Format §8.2.
+/// Derives the relay origin signed by the Dispatch service from a `relay_url`:
+/// `https://` followed by the URL's host **as written** (preserving host case), without
+/// port or path (Wire Format §8.2).
+///
+/// Matches the reference `relay_origin` derivation byte-for-byte.
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::InvalidOrigin`] if the origin does not satisfy §8.2.
-pub fn normalize_relay_origin(input: &str) -> Result<String, CryptoError> {
-    let parsed = Url::parse(input).map_err(|_| CryptoError::InvalidOrigin("not a valid URL"))?;
-    if parsed.scheme() != "https" {
-        return Err(CryptoError::InvalidOrigin("scheme must be https"));
+/// Returns [`CryptoError::InvalidOrigin`] if the URL is not `https://` or has no host.
+pub fn relay_origin(relay_url: &str) -> Result<String, CryptoError> {
+    let Some(rest) = relay_url.strip_prefix("https://") else {
+        return Err(CryptoError::InvalidOrigin("scheme must be lowercase https"));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(bracketed) = host.strip_prefix('[') {
+        bracketed.split_once(']').map_or("", |(inner, _)| inner)
+    } else {
+        host.split(':').next().unwrap_or_default()
+    };
+    if host.is_empty() {
+        return Err(CryptoError::InvalidOrigin("missing host"));
     }
+    if relay_url.contains("://[") {
+        return Ok(format!("https://[{host}]"));
+    }
+    Ok(format!("https://{host}"))
+}
+
+/// Validates a configured `RELAY_ORIGIN` value (`https://<host>` with no port, path,
+/// trailing slash, query, fragment, or userinfo) while preserving exact host spelling
+/// so signatures produced by [`relay_origin`] verify identically.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidOrigin`] if `input` is not a bare `https://<host>` origin.
+pub fn validate_relay_origin(input: &str) -> Result<String, CryptoError> {
+    if !input.starts_with("https://") {
+        return Err(CryptoError::InvalidOrigin("scheme must be lowercase https"));
+    }
+    let parsed = Url::parse(input).map_err(|_| CryptoError::InvalidOrigin("not a valid URL"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(CryptoError::InvalidOrigin("must not contain userinfo"));
     }
@@ -256,17 +289,16 @@ pub fn normalize_relay_origin(input: &str) -> Result<String, CryptoError> {
             "must not include query or fragment",
         ));
     }
-    let host = parsed
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .ok_or(CryptoError::InvalidOrigin("missing host"))?;
-    let normalized = format!("https://{host}");
-    if input.to_ascii_lowercase() != normalized {
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(CryptoError::InvalidOrigin("missing host"));
+    }
+    let derived = relay_origin(input)?;
+    if derived != input {
         return Err(CryptoError::InvalidOrigin(
-            "must be canonical https://<host> without explicit port or trailing slash",
+            "must be bare https://<host> without explicit port or trailing slash",
         ));
     }
-    Ok(normalized)
+    Ok(derived)
 }
 
 #[cfg(test)]
@@ -290,19 +322,20 @@ mod tests {
         assert!(b64_decode("AQ+D").is_err());
         assert!(b64_decode("AQ/D").is_err());
         assert!(b64_decode("AQ ID").is_err());
-        // Non-zero trailing bits in 2-char encoding of 1 byte (last 4 bits must be 0).
         assert!(b64_decode("AB").is_err());
     }
 
     #[test]
     fn verifies_official_switch_webhook_vector_byte_for_byte() {
-        // From Pubky Switch test vectors: `spec/vectors/http.json` (`webhook`) and `keys.json` (`service/alice`).
         const SWITCH_LABEL: &str = "pubky-switch/v1/push";
-        const RELAY_ORIGIN: &str = "https://push.example";
+        const RELAY_URL: &str = "https://push.example/v1/hook";
         const BODY: &[u8] = br#"{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}"#;
         const SIG_B64: &str = "yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ";
         const KEY_B64: &str = "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI";
         const SECRET_HEX: &str = "3b8b79d112af033681ded4b8aea328b91f8ddb49928a8870e9501c77fe275279";
+
+        let origin = relay_origin(RELAY_URL).unwrap();
+        assert_eq!(origin, "https://push.example");
 
         let public_key = b64_decode_array::<32>(KEY_B64).unwrap();
         let signature = b64_decode_array::<64>(SIG_B64).unwrap();
@@ -311,21 +344,15 @@ mod tests {
 
         assert_eq!(signing_key.verifying_key().to_bytes(), public_key);
 
-        // Deterministic RFC 8032 re-signing produces identical bytes.
-        let recomputed = sign_webhook(&signing_key, SWITCH_LABEL, RELAY_ORIGIN, BODY);
+        let recomputed = sign_webhook(&signing_key, SWITCH_LABEL, &origin, BODY);
         assert_eq!(b64_encode(&recomputed), SIG_B64);
 
-        // Strict verification succeeds with the exact Switch label and origin.
-        verify_webhook_signature(&public_key, SWITCH_LABEL, RELAY_ORIGIN, BODY, &signature)
-            .unwrap();
+        verify_webhook_signature(&public_key, SWITCH_LABEL, &origin, BODY, &signature).unwrap();
 
-        // Dispatch label must NOT verify a Switch-labeled signature (domain separation).
         assert!(
-            verify_webhook_signature(&public_key, SIGNING_LABEL, RELAY_ORIGIN, BODY, &signature)
+            verify_webhook_signature(&public_key, SIGNING_LABEL, &origin, BODY, &signature)
                 .is_err()
         );
-
-        // Wrong origin must fail.
         assert!(
             verify_webhook_signature(
                 &public_key,
@@ -340,7 +367,6 @@ mod tests {
 
     #[test]
     fn enforces_wire_format_2_1_ed25519_edge_vectors() {
-        // Accepted: mixed-order public key with cofactorless equation holding.
         let mixed_pk =
             b64_decode_array::<32>("24Lckov6KOJN4tsUEWMhSwTZt3TpVeUuffhN6CG4Qik").unwrap();
         let mixed_sig = b64_decode_array::<64>(
@@ -354,7 +380,6 @@ mod tests {
         assert!(validate_public_key(&mixed_pk).is_ok());
         assert!(verify_ed25519(&mixed_pk, &mixed_msg, &mixed_sig).is_ok());
 
-        // Rejections from `spec/vectors/signatures.json`.
         let cases: &[(&str, &str, &str, &str)] = &[
             (
                 "small-order identity public key",
@@ -404,7 +429,6 @@ mod tests {
             );
         }
 
-        // Non-canonical public key and small-order keys are also rejected at registration time.
         let non_canon_pk =
             b64_decode_array::<32>("8P_______________________________________38").unwrap();
         assert!(validate_public_key(&non_canon_pk).is_err());
@@ -415,13 +439,39 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_and_validates_relay_origin() {
+    fn relay_origin_preserves_mixed_case_host_spelling() {
         assert_eq!(
-            normalize_relay_origin("https://PUSH.Example").unwrap(),
-            "https://push.example"
+            relay_origin("https://Push.Example/v1/hook").unwrap(),
+            "https://Push.Example"
         );
+        assert_eq!(
+            validate_relay_origin("https://Push.Example").unwrap(),
+            "https://Push.Example"
+        );
+        assert_eq!(
+            validate_relay_origin("https://[2001:db8::1]").unwrap(),
+            "https://[2001:db8::1]"
+        );
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let body = br#"{"v":1,"handle":"abc","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}"#;
+        let service_origin = relay_origin("https://Push.Example/v1/hook").unwrap();
+        let configured_origin = validate_relay_origin("https://Push.Example").unwrap();
+        let sig = sign_webhook(&key, SIGNING_LABEL, &service_origin, body);
+        assert!(
+            verify_webhook_signature(
+                &key.verifying_key().to_bytes(),
+                SIGNING_LABEL,
+                &configured_origin,
+                body,
+                &sig
+            )
+            .is_ok()
+        );
+
         for bad in [
             "http://push.example",
+            "HTTPS://push.example",
             "https://push.example/",
             "https://push.example/v1/hook",
             "https://push.example:443",
@@ -432,7 +482,7 @@ mod tests {
             "not-a-url",
         ] {
             assert!(
-                normalize_relay_origin(bad).is_err(),
+                validate_relay_origin(bad).is_err(),
                 "expected error for {bad}"
             );
         }

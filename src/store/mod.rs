@@ -106,7 +106,8 @@ impl FromStr for ApnsEnv {
     }
 }
 
-/// Persisted mapping `handle -> (platform, device_token, push_key, apns_env, created_at_ms)`.
+/// Persisted mapping
+/// `handle -> (platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms)`.
 ///
 /// Never stores any Pubky identity, App ID, or source network address.
 #[derive(Clone, PartialEq, Eq)]
@@ -123,6 +124,8 @@ pub struct Registration {
     pub apns_env: Option<ApnsEnv>,
     /// Creation time in Unix milliseconds (UTC).
     pub created_at_ms: u64,
+    /// Last valid webhook or idempotent registration time in Unix milliseconds (UTC).
+    pub last_active_at_ms: u64,
 }
 
 impl fmt::Debug for Registration {
@@ -134,7 +137,39 @@ impl fmt::Debug for Registration {
             .field("push_key", &"<redacted>")
             .field("apns_env", &self.apns_env)
             .field("created_at_ms", &self.created_at_ms)
+            .field("last_active_at_ms", &self.last_active_at_ms)
             .finish()
+    }
+}
+
+/// Capacity and expiry bounds enforced atomically on registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistrationLimits {
+    /// Maximum total active registrations in the store.
+    pub max_registrations: u64,
+    /// Maximum active handles bound to a single `push_key`.
+    pub max_handles_per_push_key: u32,
+    /// Inactivity expiry duration in milliseconds.
+    pub ttl_ms: u64,
+}
+
+/// Result of an idempotent registration operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// A brand-new opaque handle was created.
+    Created(String),
+    /// An active registration for the same `(platform, device_token, push_key, apns_env)`
+    /// already existed and its existing handle was returned unchanged.
+    Existing(String),
+}
+
+impl RegisterOutcome {
+    /// Returns the opaque handle string.
+    #[must_use]
+    pub fn into_handle(self) -> String {
+        match self {
+            Self::Created(h) | Self::Existing(h) => h,
+        }
     }
 }
 
@@ -144,7 +179,10 @@ pub enum StoreError {
     /// A registration with the same handle already exists.
     #[error("registration handle already exists")]
     DuplicateHandle,
-    /// Store has reached its configured maximum registration capacity.
+    /// The push key already holds the maximum allowed active handles.
+    #[error("push key has reached its maximum active handle quota")]
+    PushKeyCapacityExceeded,
+    /// Store has reached its configured maximum global registration capacity.
     #[error("registration store has reached its maximum capacity")]
     CapacityExceeded,
     /// Persisted database row contained invalid or corrupted values.
@@ -157,28 +195,57 @@ pub enum StoreError {
 
 /// Storage trait for opaque handle registrations.
 ///
-/// Implementations must guarantee that registering a new handle never overwrites or
-/// redirects an existing handle, and must enforce `max_registrations` atomically when set.
+/// Implementations guarantee:
+/// - Registering a new device token or push key never overwrites, redirects, or evicts an
+///   existing handle.
+/// - Re-registering the exact same `(platform, device_token, push_key, apns_env)` while
+///   active returns the existing handle idempotently and refreshes `last_active_at_ms`.
+/// - Both per-push-key and global capacity caps are enforced atomically.
 pub trait RegistrationStore: Send + Sync {
-    /// Persists a new registration, atomically enforcing `max_registrations` when `Some`.
-    ///
-    /// Fails with [`StoreError::DuplicateHandle`] if the handle already exists, or
-    /// [`StoreError::CapacityExceeded`] if the store already holds at least
-    /// `max_registrations` entries.
+    /// Atomically returns the existing active handle for the same
+    /// `(platform, device_token, push_key, apns_env)`, or inserts `candidate` after
+    /// verifying per-push-key and global active caps.
+    fn register_or_get<'a>(
+        &'a self,
+        candidate: &'a Registration,
+        limits: RegistrationLimits,
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<RegisterOutcome, StoreError>>;
+
+    /// Directly persists a new registration, atomically enforcing `max_registrations` when
+    /// `Some`. Used by fixtures and low-level store tests.
     fn insert<'a>(
         &'a self,
         registration: &'a Registration,
         max_registrations: Option<u64>,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Looks up a registration by its opaque handle.
+    /// Looks up a registration by its opaque handle regardless of inactivity expiry.
     fn get<'a>(
         &'a self,
         handle: &'a str,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>>;
 
+    /// Looks up a registration only if it is active (`last_active_at_ms > active_cutoff_ms`).
+    fn get_active<'a>(
+        &'a self,
+        handle: &'a str,
+        active_cutoff_ms: u64,
+    ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>>;
+
+    /// Advances `last_active_at_ms` for `handle` after a valid webhook delivery.
+    fn touch_last_active<'a>(
+        &'a self,
+        handle: &'a str,
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
     /// Deletes a registration by handle, returning `true` if a row was removed.
     fn delete<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Deletes registrations whose `last_active_at_ms <= cutoff_ms`, returning how many
+    /// rows were removed.
+    fn prune_expired<'a>(&'a self, cutoff_ms: u64) -> BoxFuture<'a, Result<usize, StoreError>>;
 
     /// Verifies storage availability for health checks.
     fn ping<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>>;
@@ -197,6 +264,7 @@ mod tests {
             push_key: [0x42; 32],
             apns_env: Some(ApnsEnv::Sandbox),
             created_at_ms: 1_767_225_960_000,
+            last_active_at_ms: 1_767_225_960_000,
         };
         let rendered = format!("{reg:?}");
         assert!(!rendered.contains("secret-handle-123"));

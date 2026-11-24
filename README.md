@@ -8,11 +8,11 @@ Standalone reference push notification relay for **Pubky Dispatch**.
 
 Pubky Dispatch separates inbox hosting from mobile push credentials:
 
-1. **Identity-free storage.** The relay only stores `handle -> (platform, device_token, push_key, apns_env, created_at)`. It never accepts, resolves, or stores any Pubky identity, App ID, or user profile.
-2. **Cryptographic handle binding.** Each `POST /v1/register` call generates a fresh 128-bit cryptographically random opaque handle (`b64(16)`) bound to a single registration's Ed25519 `push_key`. Re-registering a device token always issues a new handle and never overwrites or redirects an existing handle.
-3. **Content-free wake pushes.** Webhooks carry only `{ v, handle, ts, nonce }` — zero message metadata or payload. The relay dispatches a content-free wake signal (`{"aps":{"content-available":1}}` on APNs, high-priority data-only `{"type":"wake","v":"1"}` on FCM); the mobile app wakes up and fetches encrypted entries directly from its Pubky Dispatch server.
-4. **No PII or source-IP logging.** Request handlers and structured logs never record source IP addresses, handles, device tokens, push keys, or signatures. Sensitive fields are redacted in all `Debug` implementations.
-5. **Automatic dead-token pruning.** When APNs (`410 Unregistered`, `400 BadDeviceToken` / `DeviceTokenNotForTopic`) or FCM (`404 UNREGISTERED` / invalid registration token) reports a dead token, the relay immediately deletes the handle from storage.
+1. **Identity-free storage.** The relay only stores `handle -> (platform, device_token, push_key, apns_env, created_at, last_active_at)`. It never accepts, resolves, or stores any Pubky identity, App ID, or user profile.
+2. **Cryptographic handle binding.** Each new `(platform, device_token, push_key, apns_env)` registration generates a fresh 128-bit cryptographically random opaque handle (`b64(16)`) bound to a single registration's Ed25519 `push_key`. Re-registering the exact same tuple is idempotent and returns the existing active handle; registering a different token or key always issues a new handle and never overwrites or redirects an existing handle.
+3. **Content-free wake pushes.** Webhooks carry only `{ v, handle, ts, nonce }` — zero message metadata or payload. The relay dispatches a content-free wake signal (a generic visible alert with `mutable-content: 1` by default on APNs per Spec §9, and high-priority data-only `{"type":"wake","v":"1"}` on FCM); the mobile app wakes up and fetches encrypted entries directly from its Pubky Dispatch server.
+4. **No PII or source-IP logging.** Request handlers and structured logs never record source IP addresses, handles, device tokens, push keys, signatures, or provider-supplied reason text. Sensitive fields are redacted in all `Debug` implementations.
+5. **Token-specific dead-token pruning & inactivity expiry.** The relay deletes a handle only on token-specific provider evidence (`410 Unregistered` or `400 BadDeviceToken` on APNs; `UNREGISTERED` or token-specific `INVALID_ARGUMENT` on FCM). Every other provider error keeps the handle and returns `502`. Registrations with no valid webhook activity expire automatically (default 90 days), and re-registering the same device token and `push_key` is idempotent. There is intentionally no unauthenticated delete endpoint, because anyone knowing a device token could otherwise disrupt a device's push registration.
 
 ## HTTP API
 
@@ -49,7 +49,7 @@ Content-Type: application/json
 }
 ```
 
-Errors: `400 bad_request` (invalid JSON, unknown fields, invalid token, invalid/small-order key), `413 too_large`, `429 rate_limited` (global registration limit exceeded, with `Retry-After`), `503 unavailable` (registration store capacity cap reached).
+Errors: `400 bad_request` (invalid JSON, unknown fields, invalid token, invalid/small-order key), `408 request_timeout`, `413 too_large`, `429 rate_limited` (per-IP, per-key, or global registration limit exceeded, with `Retry-After`), `429 quota_exceeded` (per-`push_key` active handle cap reached), `503 unavailable` (registration store capacity or concurrency limit reached).
 
 ---
 
@@ -106,9 +106,9 @@ Readiness and liveness probe verifying storage connectivity.
 
 ---
 
-## Mobile & Bitkit Integration Guide
+## Mobile Integration Guide
 
-Mobile apps (such as Bitkit) follow the three-step Pubky Dispatch push registration flow:
+Mobile apps follow the three-step Pubky Dispatch push registration flow:
 
 ### 1. Start registration with Pubky Dispatch
 
@@ -122,13 +122,17 @@ Each device obtains its native push token and sends it together with that `push_
   - Encode the `Data` from `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` as lowercase hex (64 characters).
   - Set `"platform": "apns"`.
   - Pass `"apns_env": "sandbox"` for Xcode/debug builds and `"apns_env": "production"` for TestFlight/App Store builds.
-  - Default relay behavior sends silent background wakes (`apns-push-type: background`, `apns-priority: 5`, `{"aps":{"content-available":1}}`). Enable `remote-notification` under Background Modes, wake on `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)`, and sync the Dispatch feed.
-  - If your iOS app uses a **Notification Service Extension** to fetch and decrypt notifications for visible banners, set `APNS_PUSH_MODE=alert` on the relay to deliver content-free `mutable-content: 1` wake pushes (`apns-push-type: alert`, `apns-priority: 10`).
+  - By default (`APNS_PUSH_MODE=alert`, required by Spec §9), the relay delivers a content-free generic visible notification (`apns-push-type: alert`, `apns-priority: 10`, `mutable-content: 1`, fixed generic text) so an iOS Notification Service Extension can peek and decrypt locally without being throttled by iOS.
+  - Silent background wakes (`APNS_PUSH_MODE=background`, `apns-push-type: background`, `apns-priority: 5`, `{"aps":{"content-available":1}}`) are an explicit opt-in; iOS throttles or drops silent background pushes under Low Power Mode or background budget limits.
 
 - **Android (FCM):**
   - Obtain the registration token via `FirebaseMessaging.getInstance().token`.
   - Set `"platform": "fcm"` and omit `apns_env`.
   - The relay sends a high-priority **data-only** FCM HTTP v1 message (`{"data":{"type":"wake","v":"1"},"android":{"collapse_key":"pubky-dispatch-wake","priority":"HIGH"}}`) with no `notification` block, ensuring `FirebaseMessagingService.onMessageReceived` runs even when the app is backgrounded or in Doze mode and coalescing bursts while offline. Trigger a background feed sync when `remoteMessage.data["type"] == "wake"`.
+
+### Provider timeout and duplicate wakes
+
+Upstream provider calls are bounded strictly below Pubky Dispatch's 5-second webhook timeout (`PROVIDER_TIMEOUT_MS`, default `3500` ms). If APNs or FCM fails to answer within that budget, the relay responds `502` and keeps the handle. If a provider accepted the push just after the relay's timeout fired and Dispatch retries with a fresh nonce, a wallet may see at most one duplicate wake for that message (handling duplicate wakes is already idempotent because apps deduplicate feed entries).
 
 ### 3. Commit handles to Pubky Dispatch
 
@@ -162,7 +166,7 @@ All options can be passed via environment variables or CLI flags (`--help` print
 | `APNS_KEY_PATH` | — | Path to APNs `.p8` PKCS#8 PEM private key file (mutually exclusive with `APNS_KEY_PEM`). |
 | `APNS_KEY_PEM` | — | Inline APNs `.p8` PEM or base64-encoded PEM. |
 | `APNS_DEFAULT_ENV` | `production` | Default APNs gateway (`production` or `sandbox`) when `apns_env` is omitted. |
-| `APNS_PUSH_MODE` | `background` | `background` (`content-available: 1`) or `alert` (`mutable-content: 1` for iOS NSE). |
+| `APNS_PUSH_MODE` | `alert` | `alert` (default per Spec §9, generic visible notification with `mutable-content: 1`) or `background` (explicit opt-in silent `content-available: 1`; subject to iOS throttling). |
 | `FCM_SERVICE_ACCOUNT_PATH` | — | Path to Google Cloud service account JSON file (mutually exclusive with `FCM_SERVICE_ACCOUNT_JSON`). |
 | `FCM_SERVICE_ACCOUNT_JSON` | — | Inline Google service account JSON or base64-encoded JSON. |
 
@@ -190,7 +194,7 @@ docker run --rm -p 8080:8080 \
   -e RELAY_ORIGIN=https://push.example.com \
   -e APNS_TEAM_ID=TEAM123456 \
   -e APNS_KEY_ID=KEY1234567 \
-  -e APNS_BUNDLE_ID=to.bitkit.app \
+  -e APNS_BUNDLE_ID=com.example.app \
   -e APNS_KEY_PEM="$APNS_P8_BASE64" \
   -e FCM_SERVICE_ACCOUNT_JSON="$FCM_SA_BASE64" \
   pubky-dispatch-push-relay
@@ -210,7 +214,7 @@ docker run --rm -p 8080:8080 \
   -e DATABASE_URL=postgres://relay:secret@postgres.internal:5432/push_relay \
   -e APNS_TEAM_ID=TEAM123456 \
   -e APNS_KEY_ID=KEY1234567 \
-  -e APNS_BUNDLE_ID=to.bitkit.app \
+  -e APNS_BUNDLE_ID=com.example.app \
   -e APNS_KEY_PEM="$APNS_P8_BASE64" \
   -e FCM_SERVICE_ACCOUNT_JSON="$FCM_SA_BASE64" \
   pubky-dispatch-push-relay
@@ -218,10 +222,10 @@ docker run --rm -p 8080:8080 \
 
 When running on PostgreSQL:
 
-- **`registrations`** persists handle mappings and enforces `MAX_REGISTRATIONS` atomically across all replicas using a transaction-scoped advisory lock (`pg_advisory_xact_lock`).
-- **`webhook_nonces` (`UNLOGGED`)** provides atomic cross-replica 10-minute nonce replay protection (`409`) without WAL overhead.
-- **`rate_limit_buckets` (`UNLOGGED`)** provides atomic cross-replica sliding-window rate limiting (`429`) for both per-handle hooks and global registrations.
-- Each replica's existing 60-second background sweep task prunes expired rows from both `UNLOGGED` tables automatically.
+- **`registrations`** persists handle mappings and enforces per-key and global caps atomically across all replicas using a transaction-scoped advisory lock (`pg_advisory_xact_lock`).
+- **`webhook_nonces`** (durable WAL-logged table) provides atomic cross-replica 10-minute nonce replay protection (`409`) using PostgreSQL server time (`clock_timestamp()`) and a bounded row cap (`503` when full rather than evicting live nonces).
+- **`rate_limit_buckets`** (durable WAL-logged table) provides atomic cross-replica sliding-window rate limiting (`429`) for per-handle hooks and per-IP, per-key, and global registrations.
+- Each replica's 60-second background sweep task prunes expired nonces, expired rate buckets, and inactive registrations automatically.
 
 ### Unauthenticated `/v1/register` Hardening
 
@@ -236,8 +240,8 @@ Because `POST /v1/register` is intentionally unauthenticated (clients submit onl
 
 Persistence, replay protection, and rate limiting sit behind clean async traits (`RegistrationStore`, `ReplayStore`, and `RateLimitStore`):
 
-- **SQLite (default):** Zero-config single-instance mode using WAL journal mode (`STRICT` table) with fast bounded in-memory replay cache and rate limiters.
-- **PostgreSQL (`DATABASE_URL=postgres://...` / `postgresql://...`):** Stateless multi-replica mode sharing persistent registrations plus `UNLOGGED` replay and rate-limit tables over a single `sqlx` connection pool (TLS via `rustls`).
+- **SQLite (default):** Zero-config single-instance mode using WAL journal mode (`STRICT` tables) with SQLite-persisted 10-minute nonce replay protection (surviving restarts, failing closed with `503` when full) and bounded in-memory rate limiters.
+- **PostgreSQL (`DATABASE_URL=postgres://...` / `postgresql://...`):** Stateless multi-replica mode sharing durable WAL-logged registrations, nonce replay protection, and rate-limit tables over a single `sqlx` connection pool (TLS via `rustls`).
 
 ## Development & Verification
 

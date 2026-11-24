@@ -14,7 +14,10 @@ use zeroize::Zeroizing;
 
 use crate::clock::{Clock, SystemClock};
 use crate::crypto::b64_encode;
-use crate::push::{PushError, PushOutcome, PushSender};
+use crate::push::{
+    DEFAULT_PROVIDER_TIMEOUT_MS, InvalidTokenClass, PushError, PushOutcome, PushSender,
+    UpstreamErrorClass, classify_http_status,
+};
 use crate::store::{ApnsEnv, BoxFuture, Registration};
 
 /// Apple APNs production HTTP/2 endpoint.
@@ -31,13 +34,19 @@ pub const APNS_JWT_TTL_SECS: u64 = 45 * 60;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApnsPushMode {
-    /// Silent background wake push (`apns-push-type: background`, `apns-priority: 5`,
-    /// `{"aps":{"content-available":1}}`).
+    /// Content-free generic visible notification (`apns-push-type: alert`,
+    /// `apns-priority: 10`, `mutable-content: 1`) as required by Spec §9.
+    ///
+    /// Allows an iOS Notification Service Extension to peek and decrypt locally while
+    /// avoiding iOS silent-push throttling.
     #[default]
-    Background,
-    /// Content-free alert wake push (`apns-push-type: alert`, `apns-priority: 10`,
-    /// `mutable-content: 1`) for apps using an iOS Notification Service Extension.
     Alert,
+    /// Opt-in silent background wake push (`apns-push-type: background`,
+    /// `apns-priority: 5`, `{"aps":{"content-available":1}}`).
+    ///
+    /// Note: iOS aggressively throttles or drops silent background pushes under Low Power
+    /// Mode or background budget limits.
+    Background,
 }
 
 /// Configuration for [`ApnsSender`].
@@ -53,13 +62,13 @@ pub struct ApnsConfig {
     pub private_key_pem: Zeroizing<String>,
     /// Default APNs environment used when a registration omits `apns_env`.
     pub default_env: ApnsEnv,
-    /// Silent background wake (default) or alert wake mode.
+    /// Generic visible alert (default per Spec §9) or opt-in silent background wake mode.
     pub push_mode: ApnsPushMode,
     /// Production gateway base URL (overrideable for testing).
     pub production_url: String,
     /// Sandbox gateway base URL (overrideable for testing).
     pub sandbox_url: String,
-    /// Upstream HTTP request timeout.
+    /// Upstream HTTP request timeout (defaults to 3.5 s, strictly below Dispatch's 5 s timeout).
     pub timeout: Duration,
 }
 
@@ -80,25 +89,26 @@ impl fmt::Debug for ApnsConfig {
 }
 
 impl ApnsConfig {
-    /// Creates an [`ApnsConfig`] with default Apple gateway URLs and a 10-second timeout.
+    /// Creates an [`ApnsConfig`] with default Apple gateway URLs, visible alert mode
+    /// (Spec §9), and a 3.5-second timeout.
     #[must_use]
     pub fn new(
         team_id: String,
         key_id: String,
         bundle_id: String,
-        private_key_pem: String,
+        private_key_pem: Zeroizing<String>,
         default_env: ApnsEnv,
     ) -> Self {
         Self {
             team_id,
             key_id,
             bundle_id,
-            private_key_pem: Zeroizing::new(private_key_pem),
+            private_key_pem,
             default_env,
-            push_mode: ApnsPushMode::Background,
+            push_mode: ApnsPushMode::Alert,
             production_url: APNS_PRODUCTION_URL.to_owned(),
             sandbox_url: APNS_SANDBOX_URL.to_owned(),
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_millis(DEFAULT_PROVIDER_TIMEOUT_MS),
         }
     }
 }
@@ -155,6 +165,8 @@ impl fmt::Debug for ApnsSender {
 impl ApnsSender {
     /// Constructs a new [`ApnsSender`] backed by the system clock.
     ///
+    /// Validates the `.p8` P-256 signing key immediately at startup.
+    ///
     /// # Errors
     ///
     /// Returns [`PushError::Config`] if configuration fields are empty, the `.p8` key
@@ -179,13 +191,16 @@ impl ApnsSender {
         }
 
         let signing_key = SigningKey::from_pkcs8_pem(config.private_key_pem.as_str())
-            .map_err(|e| PushError::Config(format!("invalid APNs .p8 PKCS#8 PEM key: {e}")))?;
+            .map_err(|_| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()))?;
+
+        // Exercise signing at startup so key issues fail immediately rather than on first push.
+        let _: Signature = signing_key.sign(b"apns-startup-check");
 
         let client = Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| PushError::Config(format!("failed to build APNs HTTP client: {e}")))?;
+            .map_err(|_| PushError::Config("failed to build APNs HTTP client".to_owned()))?;
 
         Ok(Self {
             client,
@@ -230,12 +245,16 @@ impl ApnsSender {
             alg: "ES256",
             kid: &self.key_id,
         })
-        .map_err(|e| PushError::Auth(format!("failed to encode APNs JWT header: {e}")))?;
+        .map_err(|_| PushError::Auth {
+            class: UpstreamErrorClass::Auth,
+        })?;
         let claims_json = serde_json::to_vec(&JwtClaims {
             iss: &self.team_id,
             iat: iat_secs,
         })
-        .map_err(|e| PushError::Auth(format!("failed to encode APNs JWT claims: {e}")))?;
+        .map_err(|_| PushError::Auth {
+            class: UpstreamErrorClass::Auth,
+        })?;
 
         let signing_input = format!("{}.{}", b64_encode(&header_json), b64_encode(&claims_json));
         let signature: Signature = self.signing_key.sign(signing_input.as_bytes());
@@ -248,15 +267,15 @@ impl ApnsSender {
 
     fn wake_payload(&self) -> (&'static str, &'static str, &'static [u8]) {
         match self.push_mode {
+            ApnsPushMode::Alert => (
+                "alert",
+                "10",
+                br#"{"aps":{"mutable-content":1,"alert":{"title":"New notification","body":"Open the app to view."}}}"#,
+            ),
             ApnsPushMode::Background => (
                 "background",
                 "5",
                 br#"{"aps":{"content-available":1}}"#,
-            ),
-            ApnsPushMode::Alert => (
-                "alert",
-                "10",
-                br#"{"aps":{"mutable-content":1,"content-available":1,"alert":{"title":"New activity","body":"Open the app to check for updates."}}}"#,
             ),
         }
     }
@@ -269,12 +288,13 @@ impl ApnsSender {
         };
         let url = format!("{base_url}/3/device/{}", registration.device_token);
         let jwt = self.bearer_jwt()?;
+        let auth_header = Zeroizing::new(format!("bearer {}", jwt.as_str()));
         let (push_type, priority, body) = self.wake_payload();
 
         let response = self
             .client
             .post(&url)
-            .header("authorization", format!("bearer {}", jwt.as_str()))
+            .header("authorization", auth_header.as_str())
             .header("apns-topic", &self.bundle_id)
             .header("apns-push-type", push_type)
             .header("apns-priority", priority)
@@ -283,8 +303,13 @@ impl ApnsSender {
             .body(body)
             .send()
             .await
-            .map_err(|e| {
-                PushError::Upstream(format!("APNs request failed: {}", e.without_url()))
+            .map_err(|e| PushError::Upstream {
+                class: if e.is_timeout() {
+                    UpstreamErrorClass::Timeout
+                } else {
+                    UpstreamErrorClass::Transport
+                },
+                status: None,
             })?;
 
         let status = response.status();
@@ -292,28 +317,26 @@ impl ApnsSender {
             return Ok(ApnsResponse::Outcome(PushOutcome::Delivered));
         }
 
-        let error_reason = response
+        let status_code = status.as_u16();
+        let reason = response
             .bytes()
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ApnsErrorBody>(&bytes).ok())
-            .and_then(|body| body.reason)
-            .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+            .and_then(|body| body.reason);
 
-        if status.as_u16() == 403 && error_reason == "ExpiredProviderToken" {
+        if status_code == 403 && reason.as_deref() == Some("ExpiredProviderToken") {
             return Ok(ApnsResponse::ExpiredToken);
         }
 
-        if is_invalid_apns_token(status.as_u16(), &error_reason) {
-            return Ok(ApnsResponse::Outcome(PushOutcome::InvalidToken {
-                reason: error_reason,
-            }));
+        if let Some(class) = classify_invalid_apns_token(status_code, reason.as_deref()) {
+            return Ok(ApnsResponse::Outcome(PushOutcome::InvalidToken { class }));
         }
 
-        Err(PushError::Upstream(format!(
-            "APNs rejected push with status {} ({error_reason})",
-            status.as_u16()
-        )))
+        Err(PushError::Upstream {
+            class: classify_http_status(status_code),
+            status: Some(status_code),
+        })
     }
 }
 
@@ -322,15 +345,18 @@ enum ApnsResponse {
     ExpiredToken,
 }
 
-fn is_invalid_apns_token(status: u16, reason: &str) -> bool {
-    if status == 410 {
-        return true;
+/// Requires explicit token-specific APNs evidence before deleting a handle:
+/// - `410 Gone` with JSON `reason == "Unregistered"`
+/// - `400 Bad Request` with JSON `reason == "BadDeviceToken"`
+///
+/// Every other response (including `410` without `Unregistered` and `400 DeviceTokenNotForTopic`,
+/// which can reflect server topic misconfiguration) preserves the registration.
+fn classify_invalid_apns_token(status: u16, reason: Option<&str>) -> Option<InvalidTokenClass> {
+    match (status, reason) {
+        (410, Some("Unregistered")) => Some(InvalidTokenClass::ApnsUnregistered),
+        (400, Some("BadDeviceToken")) => Some(InvalidTokenClass::ApnsBadDeviceToken),
+        _ => None,
     }
-    status == 400
-        && matches!(
-            reason,
-            "BadDeviceToken" | "DeviceTokenNotForTopic" | "Unregistered"
-        )
 }
 
 impl PushSender for ApnsSender {
@@ -345,9 +371,9 @@ impl PushSender for ApnsSender {
                     self.invalidate_jwt();
                     match self.send_once(registration).await? {
                         ApnsResponse::Outcome(outcome) => Ok(outcome),
-                        ApnsResponse::ExpiredToken => Err(PushError::Auth(
-                            "APNs rejected refreshed provider JWT".to_owned(),
-                        )),
+                        ApnsResponse::ExpiredToken => Err(PushError::Auth {
+                            class: UpstreamErrorClass::Auth,
+                        }),
                     }
                 }
             }
@@ -360,16 +386,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apns_config_debug_redacts_private_key() {
+    fn apns_config_defaults_to_alert_and_redacts_private_key() {
         let cfg = ApnsConfig::new(
             "TEAM123456".to_owned(),
             "KEY1234567".to_owned(),
             "com.example.app".to_owned(),
-            "-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n-----END PRIVATE KEY-----".to_owned(),
+            Zeroizing::new(
+                "-----BEGIN PRIVATE KEY-----\nSUPERSECRET\n-----END PRIVATE KEY-----".to_owned(),
+            ),
             ApnsEnv::Production,
+        );
+        assert_eq!(cfg.push_mode, ApnsPushMode::Alert);
+        assert_eq!(
+            cfg.timeout,
+            Duration::from_millis(DEFAULT_PROVIDER_TIMEOUT_MS)
         );
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("SUPERSECRET"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn classifies_only_token_specific_apns_errors_as_invalid() {
+        assert_eq!(
+            classify_invalid_apns_token(410, Some("Unregistered")),
+            Some(InvalidTokenClass::ApnsUnregistered)
+        );
+        assert_eq!(
+            classify_invalid_apns_token(400, Some("BadDeviceToken")),
+            Some(InvalidTokenClass::ApnsBadDeviceToken)
+        );
+
+        // Ambiguous or configuration-related errors must NOT prune handles.
+        for (status, reason) in [
+            (410, None),
+            (410, Some("Other")),
+            (400, Some("DeviceTokenNotForTopic")),
+            (400, Some("BadTopic")),
+            (400, None),
+            (403, Some("InvalidProviderToken")),
+            (429, Some("TooManyRequests")),
+            (500, Some("InternalServerError")),
+            (503, Some("ServiceUnavailable")),
+        ] {
+            assert_eq!(
+                classify_invalid_apns_token(status, reason),
+                None,
+                "expected non-pruning for ({status}, {reason:?})"
+            );
+        }
     }
 }

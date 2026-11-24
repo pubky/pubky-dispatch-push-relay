@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,18 +13,17 @@ use tracing_subscriber::EnvFilter;
 
 use pubky_dispatch_push_relay::clock::SystemClock;
 use pubky_dispatch_push_relay::config::{CliArgs, LogFormat, PushBackendMode};
-use pubky_dispatch_push_relay::http::{RelayState, router};
+use pubky_dispatch_push_relay::http::{RateLimitBackends, RelayState, router};
 use pubky_dispatch_push_relay::push::apns::ApnsSender;
 use pubky_dispatch_push_relay::push::fcm::FcmSender;
 use pubky_dispatch_push_relay::push::noop::NoopSender;
 use pubky_dispatch_push_relay::push::{PushSender, RouterPushSender};
-use pubky_dispatch_push_relay::rate_limit::RateLimitStore;
 use pubky_dispatch_push_relay::replay::ReplayStore;
 use pubky_dispatch_push_relay::store::is_postgres_url;
 use pubky_dispatch_push_relay::store::postgres::{
     PostgresRateLimitStore, PostgresReplayStore, PostgresStore,
 };
-use pubky_dispatch_push_relay::store::sqlite::SqliteStore;
+use pubky_dispatch_push_relay::store::sqlite::{SqliteReplayStore, SqliteStore};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -75,21 +75,47 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let clock = Arc::new(SystemClock);
-    let state = if is_postgres_url(&args.database_url) {
-        let pg_store = Arc::new(PostgresStore::open(&args.database_url).await?);
+    let database_url = args.database_url();
+    let state = if is_postgres_url(database_url.as_str()) {
+        let pg_store = Arc::new(PostgresStore::open(database_url.as_str()).await?);
         let pool = pg_store.pool().clone();
-        let replay: Arc<dyn ReplayStore> = Arc::new(PostgresReplayStore::new(pool.clone()).await?);
-        let hook_limiter: Arc<dyn RateLimitStore> = Arc::new(
-            PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
-                .await?,
+        let replay: Arc<dyn ReplayStore> = Arc::new(
+            PostgresReplayStore::new(pool.clone(), settings.nonce_cache_max_entries).await?,
         );
-        let register_limiter: Arc<dyn RateLimitStore> = Arc::new(
-            PostgresRateLimitStore::new(pool, "register", settings.register_rate_limit_per_minute)
+        let limiters = RateLimitBackends {
+            hook_per_handle: Arc::new(
+                PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
+                    .await?,
+            ),
+            register_per_ip: Arc::new(
+                PostgresRateLimitStore::new(
+                    pool.clone(),
+                    "register_ip",
+                    settings.register_ip_rate_limit_per_minute,
+                )
                 .await?,
-        );
+            ),
+            register_per_key: Arc::new(
+                PostgresRateLimitStore::new(
+                    pool.clone(),
+                    "register_key",
+                    settings.register_key_rate_limit_per_minute,
+                )
+                .await?,
+            ),
+            register_global: Arc::new(
+                PostgresRateLimitStore::new(
+                    pool,
+                    "register_global",
+                    settings.register_rate_limit_per_minute,
+                )
+                .await?,
+            ),
+        };
         tracing::info!(
             storage = "postgres",
-            coordination = "postgres_unlogged",
+            replay = "postgres_durable",
+            rate_limits = "postgres_durable",
             "initialized multi-replica PostgreSQL backend"
         );
         RelayState::with_backends(
@@ -97,18 +123,33 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             push_sender,
             clock,
             replay,
-            hook_limiter,
-            register_limiter,
+            limiters,
             settings.clone(),
         )
     } else {
-        let sqlite_store = Arc::new(SqliteStore::open(&args.database_url).await?);
+        let sqlite_store = Arc::new(SqliteStore::open(database_url.as_str()).await?);
+        let replay: Arc<dyn ReplayStore> = Arc::new(
+            SqliteReplayStore::new(
+                sqlite_store.pool().clone(),
+                settings.nonce_cache_max_entries,
+            )
+            .await?,
+        );
+        let limiters = RelayState::in_memory_limiters(&settings);
         tracing::info!(
             storage = "sqlite",
-            coordination = "in_memory",
+            replay = "sqlite_durable",
+            rate_limits = "in_memory",
             "initialized single-instance SQLite backend"
         );
-        RelayState::new(sqlite_store, push_sender, clock, settings.clone())
+        RelayState::with_backends(
+            sqlite_store,
+            push_sender,
+            clock,
+            replay,
+            limiters,
+            settings.clone(),
+        )
     };
 
     let sweep_state = state.clone();
@@ -131,9 +172,12 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         "pubky-dispatch-push-relay listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     let _ = shutdown_tx.send(true);
     let _ = sweep_task.await;

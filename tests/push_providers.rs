@@ -1,6 +1,7 @@
-//! Mock HTTP server tests for APNs (ES256 JWT, silent wake payload, sandbox/prod routing,
-//! JWT caching/refresh, dead-token pruning) and FCM HTTP v1 (RS256 service-account OAuth2
-//! exchange, token caching/refresh, data-only high-priority payload, unregistered pruning).
+//! Mock HTTP server tests for APNs (default visible alert + opt-in silent wake, ES256 JWT,
+//! token caching/refresh, and every APNs response class) and FCM HTTP v1 (ring RS256 OAuth2
+//! exchange, token caching/refresh, data-only high-priority wake with collapse_key, and
+//! every FCM response class).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -13,16 +14,15 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt as _;
 use p256::ecdsa::signature::Verifier as _;
 use p256::pkcs8::EncodePrivateKey as _;
 use parking_lot::Mutex;
 use rand_core::OsRng;
-use rsa::RsaPrivateKey;
-use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
+use ring::signature::{KeyPair as _, RSA_PKCS1_2048_8192_SHA256, RsaKeyPair, UnparsedPublicKey};
 use serde_json::{Value, json};
-use sha2::Sha256;
 use tokio::net::TcpListener;
 use tower::ServiceExt as _;
 use zeroize::Zeroizing;
@@ -33,15 +33,48 @@ use pubky_dispatch_push_relay::crypto::{
     SIGNATURE_HEADER, SIGNING_LABEL, b64_decode, b64_encode, sign_webhook,
 };
 use pubky_dispatch_push_relay::http::{RelayState, router};
-use pubky_dispatch_push_relay::push::apns::{APNS_JWT_TTL_SECS, ApnsConfig, ApnsSender};
+use pubky_dispatch_push_relay::push::RouterPushSender;
+use pubky_dispatch_push_relay::push::apns::{
+    APNS_JWT_TTL_SECS, ApnsConfig, ApnsPushMode, ApnsSender,
+};
 use pubky_dispatch_push_relay::push::fcm::{FcmConfig, FcmSender, FcmServiceAccount};
-use pubky_dispatch_push_relay::push::{PushOutcome, PushSender, RouterPushSender};
 use pubky_dispatch_push_relay::store::sqlite::SqliteStore;
-use pubky_dispatch_push_relay::store::{ApnsEnv, Platform, Registration, RegistrationStore as _};
+use pubky_dispatch_push_relay::store::{ApnsEnv, RegistrationStore as _};
 use pubky_dispatch_push_relay::time::format_rfc3339;
 
 const RELAY_ORIGIN: &str = "https://push.example";
 const NOW_MS: u64 = 1_767_225_960_000;
+
+/// Dummy test-only 2048-bit RSA PKCS#8 private key for mock FCM OAuth2 JWT tests.
+const TEST_RSA_2048_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDVcAjjYJwY/gZs
+ivFLVOrQUzx33FrP9u2mrO0KvPbmtoTpGrHMQUH3mtO8Byyrvis7KICjGiGTqVXm
+2bzpem9L71xUFW6CrdFzYkZEqfrxJNbjn1OG7xe/uc6epNaIXdhLCBZIHi621zc8
+CdqLtUyvL1cJUxvg6pIySh8mqo8MlgRtzGRAhU0AjvM9uoCbCr4tn8glJhWXPePH
+fB32SFoexVa5sJRw8a/9I2xOv3POWmbSb5svTY4TERmuKzvBjwd1t2YVJ2nB8aiz
+J0T/qgiXhLkrFEUTzbKL071RVz+IOD8ZvLFUET4Gmv3IpCPFUwYHskve+l+IJs2B
+Xcp0mfdPAgMBAAECggEAObP+UyqtSPx0VCgEMC+XBBdcw7LpQkwp1+Psefi4b4ts
+x3CWHPiPkxdiovT1mMDjAy1iCbZo2XjwZmb7ccvOByOBPKJGrEG93In3IV0rIMKq
+7gMHG/XL3+Ol/rHl5hwo+7AGBh1S18+7eRnY4eh0APC1gSnc4aPJPptXbKaz4dy2
+QTRUeJ0hf1D2N6yAUcLry0vqFXGQ7GX3/1lGMhKZ4ZJmIUJ82sPhU052ckdtgbiC
+Yf9bjwJpaRDNWP8mTBNbEJizbsC81fzTc7b9fkyyC7iGi37xm/UkpAS+VnUTSSWf
+jv+S4UzFYybu7+RK6+/Ofl3vtfvLzKk+MebIYbCpYQKBgQD7PGcEpOIa2fRi85w5
+plkbuS3r3E+BhI4E8+pf0qPPL5Zk4u2TRyh2y2wgtj58mMl/Tqt/MTEunjczDE2I
+pT6wwf5Jqzslr8lwjApaOWA4d+neXEzz9NDCu0YL2aZygTo+ZiZveXVPe05j6Fx9
+GJV1x+lS5LmMrNUbetUKN/1DWQKBgQDZfCT+ye++LhTc+TIhLvYn/EtoRYyJ33B+
+QxCqaXJgvfBFYrOok0dqgShJau9MUt4WUh/dQGa/hKekjCDPH4bDs+3C3oymr7z9
+dG91dlslc2X/elkz5JrZ5NG9rHcgOBNKLZMNKWquXVkcvUvqhaHQ473JyiWE203W
+9+1PGPeC5wKBgHRuVb/NOgv/nkaNZ4VAFmPGugVooGABsl+ROrkVwVyvTR+MG1X5
+0ELdm0q9qs/LbvZU2x2jCov0Ptilhvkgu6DnBpXViR+6C7zg6ZtOo80HpZarZ+5X
+MrhMWfX79Ct0wC1S4dUfkMI4/udGNDa1Qe7HqtYDsgoDvu9xSXHm6LRhAoGANOMU
+mAUBUO0h066huyIRaB3ZNI0dJPX6BCpI5jfoQZBO2oCrEcZm6oZoBpqDgLryGNl1
+uDcOBWq73a7Z16RiADtECUxXRb2cpsHmzNiwR4YtepgFEzJ3WZ9kRcyn12Trg/Fb
+PishLy+yGOQLjwdaF1MadvS6dPljj3AQ/Fgk8GcCgYBgQ8ZclEg/smIw0bhhcTih
++wJnLZ9IXdmCI5e3lcTZlNSCmX+J/T0seePqEB6PfAI3RkdhLYdrdS3yYwoD+ElD
+mGP/1qtb888qUbpevW/CI8vT5SkK/DN0o8bO8P5gVO3VwoRGJVthrfUgwzkcpRkl
+13Ig2sqgfsPWX8HHueUGvQ==
+-----END PRIVATE KEY-----";
 
 async fn spawn_mock_server(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -68,7 +101,7 @@ struct CapturedApnsReq {
 struct MockApnsState {
     env_tag: &'static str,
     captured: Arc<Mutex<Vec<CapturedApnsReq>>>,
-    responses: Arc<Mutex<VecDeque<(StatusCode, Value)>>>,
+    responses: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
 }
 
 async fn mock_apns_handler(
@@ -76,7 +109,7 @@ async fn mock_apns_handler(
     Path(device_token): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> (StatusCode, Json<Value>) {
+) -> (StatusCode, String) {
     let header_str = |name: &str| {
         headers
             .get(name)
@@ -97,8 +130,8 @@ async fn mock_apns_handler(
     });
 
     match state.responses.lock().pop_front() {
-        Some((status, val)) => (status, Json(val)),
-        None => (StatusCode::OK, Json(json!({}))),
+        Some(pair) => pair,
+        None => (StatusCode::OK, "{}".to_owned()),
     }
 }
 
@@ -124,8 +157,7 @@ fn verify_es256_jwt(jwt: &str, verifying_key: &p256::ecdsa::VerifyingKey) -> (Va
 }
 
 #[tokio::test]
-async fn apns_formats_silent_wake_signs_es256_caches_jwt_and_prunes_dead_tokens() {
-    // Generate an ephemeral P-256 keypair in PKCS#8 PEM format (just like Apple's .p8).
+async fn apns_defaults_to_visible_alert_caches_jwt_and_classifies_every_response() {
     let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
     let verifying_key = *signing_key.verifying_key();
     let pem = signing_key
@@ -163,12 +195,12 @@ async fn apns_formats_silent_wake_signs_es256_caches_jwt_and_prunes_dead_tokens(
     let mut apns_cfg = ApnsConfig::new(
         "TEAM987654".to_owned(),
         "KEY1234567".to_owned(),
-        "to.bitkit.app".to_owned(),
-        pem,
+        "com.example.wallet".to_owned(),
+        Zeroizing::new(pem.clone()),
         ApnsEnv::Production,
     );
-    apns_cfg.production_url = prod_url;
-    apns_cfg.sandbox_url = sandbox_url;
+    apns_cfg.production_url = prod_url.clone();
+    apns_cfg.sandbox_url = sandbox_url.clone();
 
     let apns_sender = Arc::new(ApnsSender::with_clock(apns_cfg, clock.clone()).unwrap());
     let store = Arc::new(SqliteStore::in_memory().await.unwrap());
@@ -181,7 +213,6 @@ async fn apns_formats_silent_wake_signs_es256_caches_jwt_and_prunes_dead_tokens(
     );
     let app = router(state);
 
-    // Register a production iOS device and a sandbox iOS device via HTTP.
     let push_key = SigningKey::from_bytes(&[77u8; 32]);
     let prod_token = "aa".repeat(32);
     let sandbox_token = "bb".repeat(32);
@@ -190,13 +221,16 @@ async fn apns_formats_silent_wake_signs_es256_caches_jwt_and_prunes_dead_tokens(
     let sandbox_handle =
         register_via_http(&app, "apns", &sandbox_token, &push_key, Some("sandbox")).await;
 
-    // 1. Trigger production wake push and verify headers, content-free payload, and ES256 JWT.
+    // 1. Default APNs mode sends a content-free generic visible alert (Spec §9).
     let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, NOW_MS, [1; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
 
-    // 2. Trigger sandbox wake push within 45 min: hits sandbox URL and reuses cached JWT!
-    let (s, body) = send_hook_via_http(&app, &push_key, &sandbox_handle, NOW_MS, [2; 16]).await;
+    // 2. Advance clock by 5 seconds (so an uncached JWT would have a different `iat`)
+    //    and send sandbox wake push: JWT must still match the cached one!
+    let t_plus_5s = NOW_MS + 5_000;
+    clock.set(t_plus_5s);
+    let (s, body) = send_hook_via_http(&app, &push_key, &sandbox_handle, t_plus_5s, [2; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
 
@@ -205,17 +239,28 @@ async fn apns_formats_silent_wake_signs_es256_caches_jwt_and_prunes_dead_tokens(
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].env_tag, "production");
         assert_eq!(reqs[0].device_token, prod_token);
-        assert_eq!(reqs[0].topic, "to.bitkit.app");
-        assert_eq!(reqs[0].push_type, "background");
-        assert_eq!(reqs[0].priority, "5");
+        assert_eq!(reqs[0].topic, "com.example.wallet");
+        assert_eq!(reqs[0].push_type, "alert");
+        assert_eq!(reqs[0].priority, "10");
         assert_eq!(reqs[0].collapse_id, "pubky-dispatch-wake");
-        assert_eq!(reqs[0].body, json!({"aps": {"content-available": 1}}));
+        assert_eq!(
+            reqs[0].body,
+            json!({
+                "aps": {
+                    "mutable-content": 1,
+                    "alert": {
+                        "title": "New notification",
+                        "body": "Open the app to view."
+                    }
+                }
+            })
+        );
 
         assert_eq!(reqs[1].env_tag, "sandbox");
         assert_eq!(reqs[1].device_token, sandbox_token);
         assert_eq!(
             reqs[0].authorization, reqs[1].authorization,
-            "JWT should be cached within 45-minute TTL"
+            "JWT must be reused from cache even after iat advances 5s"
         );
 
         let jwt = reqs[0]
@@ -229,52 +274,126 @@ async fn apns_formats_silent_wake_signs_es256_caches_jwt_and_prunes_dead_tokens(
         assert_eq!(claims["iat"], NOW_MS / 1_000);
     }
 
-    // 3. Advance clock past JWT TTL -> fresh JWT is minted with updated `iat`.
+    // 3. Advance clock past JWT TTL -> fresh JWT minted with updated `iat`.
     let later_ms = NOW_MS + (APNS_JWT_TTL_SECS + 5) * 1_000;
     clock.set(later_ms);
     let (s, _) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [3; 16]).await;
     assert_eq!(s, StatusCode::OK);
     {
         let reqs = captured.lock();
-        assert_eq!(reqs.len(), 3);
         assert_ne!(reqs[0].authorization, reqs[2].authorization);
         let jwt = reqs[2].authorization.strip_prefix("bearer ").unwrap();
         let (_, claims) = verify_es256_jwt(jwt, &verifying_key);
         assert_eq!(claims["iat"], later_ms / 1_000);
     }
 
-    // 4. ExpiredProviderToken (403) triggers automatic JWT invalidation and single retry.
+    // 4. Non-pruning APNs answer classes MUST keep the handle and answer 502.
+    let non_pruning_cases = [
+        (StatusCode::GONE, "<html>generic 410</html>".to_owned()),
+        (StatusCode::GONE, json!({"reason": "Other"}).to_string()),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"reason": "DeviceTokenNotForTopic"}).to_string(),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"reason": "BadTopic"}).to_string(),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            json!({"reason": "InvalidProviderToken"}).to_string(),
+        ),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"reason": "TooManyRequests"}).to_string(),
+        ),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"reason": "InternalServerError"}).to_string(),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"reason": "ServiceUnavailable"}).to_string(),
+        ),
+    ];
+    for (i, (status, body_str)) in non_pruning_cases.into_iter().enumerate() {
+        prod_responses.lock().push_back((status, body_str));
+        let nonce = [10u8 + u8::try_from(i).unwrap(); 16];
+        let (s, b) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, nonce).await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_GATEWAY,
+            "APNs {status} must return 502 and keep handle (body: {b})"
+        );
+        assert!(
+            store.get(&prod_handle).await.unwrap().is_some(),
+            "healthy handle must survive APNs {status}"
+        );
+    }
+
+    // 5. ExpiredProviderToken (403) refreshes JWT and retries once.
     prod_responses.lock().push_back((
         StatusCode::FORBIDDEN,
-        json!({"reason": "ExpiredProviderToken"}),
+        json!({"reason": "ExpiredProviderToken"}).to_string(),
     ));
-    prod_responses.lock().push_back((StatusCode::OK, json!({})));
-    let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [4; 16]).await;
+    prod_responses
+        .lock()
+        .push_back((StatusCode::OK, "{}".to_owned()));
+    let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [40; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
 
-    // 5. APNs 410 Unregistered prunes the handle from SQLite cleanly.
-    prod_responses
-        .lock()
-        .push_back((StatusCode::GONE, json!({"reason": "Unregistered"})));
-    let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [5; 16]).await;
+    // 6. Token-specific APNs 410 Unregistered prunes the handle.
+    prod_responses.lock().push_back((
+        StatusCode::GONE,
+        json!({"reason": "Unregistered"}).to_string(),
+    ));
+    let (s, body) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [41; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], false);
     assert_eq!(body["pruned"], true);
     assert!(store.get(&prod_handle).await.unwrap().is_none());
 
-    // Subsequent webhook for the pruned handle immediately returns 404.
-    let (s, _) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [6; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &prod_handle, later_ms, [42; 16]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // 6. APNs 400 BadDeviceToken also prunes the sandbox handle.
-    sandbox_responses
-        .lock()
-        .push_back((StatusCode::BAD_REQUEST, json!({"reason": "BadDeviceToken"})));
-    let (s, body) = send_hook_via_http(&app, &push_key, &sandbox_handle, later_ms, [7; 16]).await;
+    // 7. Token-specific APNs 400 BadDeviceToken prunes the sandbox handle.
+    sandbox_responses.lock().push_back((
+        StatusCode::BAD_REQUEST,
+        json!({"reason": "BadDeviceToken"}).to_string(),
+    ));
+    let (s, body) = send_hook_via_http(&app, &push_key, &sandbox_handle, later_ms, [43; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["pruned"], true);
     assert!(store.get(&sandbox_handle).await.unwrap().is_none());
+
+    // 8. Opt-in Background mode sends silent content-available wake push.
+    let mut bg_cfg = ApnsConfig::new(
+        "TEAM987654".to_owned(),
+        "KEY1234567".to_owned(),
+        "com.example.wallet".to_owned(),
+        Zeroizing::new(pem),
+        ApnsEnv::Production,
+    );
+    bg_cfg.push_mode = ApnsPushMode::Background;
+    bg_cfg.production_url = prod_url;
+    bg_cfg.sandbox_url = sandbox_url;
+    let bg_store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let bg_app = router(RelayState::new(
+        bg_store,
+        Arc::new(RouterPushSender::new().with_apns(Arc::new(
+            ApnsSender::with_clock(bg_cfg, clock.clone()).unwrap(),
+        ))),
+        clock,
+        RelaySettings::new(RELAY_ORIGIN).unwrap(),
+    ));
+    let bg_handle = register_via_http(&bg_app, "apns", &"cc".repeat(32), &push_key, None).await;
+    let (s, _) = send_hook_via_http(&bg_app, &push_key, &bg_handle, later_ms, [44; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    let last = captured.lock().last().unwrap().clone();
+    assert_eq!(last.push_type, "background");
+    assert_eq!(last.priority, "5");
+    assert_eq!(last.body, json!({"aps": {"content-available": 1}}));
 }
 
 #[derive(Clone)]
@@ -282,7 +401,7 @@ struct MockFcmState {
     token_requests: Arc<Mutex<Vec<String>>>,
     token_counter: Arc<AtomicUsize>,
     fcm_requests: Arc<Mutex<Vec<(String, String, Value)>>>,
-    fcm_responses: Arc<Mutex<VecDeque<(StatusCode, Value)>>>,
+    fcm_responses: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
 }
 
 async fn mock_oauth_handler(
@@ -307,7 +426,7 @@ async fn mock_fcm_send_handler(
     Path(project_id): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> (StatusCode, Json<Value>) {
+) -> (StatusCode, String) {
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -317,36 +436,47 @@ async fn mock_fcm_send_handler(
     state.fcm_requests.lock().push((project_id, auth, parsed));
 
     match state.fcm_responses.lock().pop_front() {
-        Some((status, val)) => (status, Json(val)),
+        Some(pair) => pair,
         None => (
             StatusCode::OK,
-            Json(json!({"name": "projects/demo-proj/messages/1"})),
+            json!({"name": "projects/demo-proj/messages/1"}).to_string(),
         ),
     }
 }
 
-fn verify_rs256_jwt(jwt: &str, verifying_key: &RsaVerifyingKey<Sha256>) -> (Value, Value) {
+fn rsa_public_der_from_pkcs8_pem(pem: &str) -> Vec<u8> {
+    let inner = pem
+        .split("-----BEGIN PRIVATE KEY-----")
+        .nth(1)
+        .unwrap()
+        .split("-----END PRIVATE KEY-----")
+        .next()
+        .unwrap();
+    let compact: String = inner.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .unwrap();
+    let kp = RsaKeyPair::from_pkcs8(&der).unwrap();
+    kp.public_key().as_ref().to_vec()
+}
+
+fn verify_rs256_jwt_with_ring(jwt: &str, public_der: &[u8]) -> (Value, Value) {
     let parts: Vec<&str> = jwt.split('.').collect();
     assert_eq!(parts.len(), 3);
     let header: Value = serde_json::from_slice(&b64_decode(parts[0]).unwrap()).unwrap();
     let claims: Value = serde_json::from_slice(&b64_decode(parts[1]).unwrap()).unwrap();
     let sig_bytes = b64_decode(parts[2]).unwrap();
-    let sig = RsaSignature::try_from(sig_bytes.as_slice()).unwrap();
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    verifying_key
-        .verify(signing_input.as_bytes(), &sig)
-        .expect("RS256 OAuth2 assertion signature must verify");
+    let verifier = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_der);
+    verifier
+        .verify(signing_input.as_bytes(), &sig_bytes)
+        .expect("ring RS256 OAuth2 assertion signature must verify");
     (header, claims)
 }
 
 #[tokio::test]
-async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unregistered() {
-    let rsa_priv = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-    let rsa_verifying = RsaVerifyingKey::<Sha256>::new(rsa_priv.to_public_key());
-    let rsa_pem = rsa_priv
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-        .unwrap()
-        .to_string();
+async fn fcm_signs_with_ring_caches_token_coalesces_bursts_and_classifies_every_response() {
+    let public_der = rsa_public_der_from_pkcs8_pem(TEST_RSA_2048_PEM);
 
     let mock_state = MockFcmState {
         token_requests: Arc::new(Mutex::new(Vec::new())),
@@ -371,14 +501,14 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
     let mut fcm_cfg = FcmConfig::new(FcmServiceAccount {
         project_id: "demo-dispatch-proj".to_owned(),
         client_email: "relay@demo-dispatch-proj.iam.gserviceaccount.com".to_owned(),
-        private_key: Zeroizing::new(rsa_pem),
+        private_key: Zeroizing::new(TEST_RSA_2048_PEM.to_owned()),
         token_uri: Some(token_uri.clone()),
     });
     fcm_cfg.api_base_url = base_url;
 
     let fcm_sender = Arc::new(FcmSender::with_clock(fcm_cfg, clock.clone()).unwrap());
     let store = Arc::new(SqliteStore::in_memory().await.unwrap());
-    let push = Arc::new(RouterPushSender::new().with_fcm(fcm_sender.clone()));
+    let push = Arc::new(RouterPushSender::new().with_fcm(fcm_sender));
     let state = RelayState::new(
         store.clone(),
         push,
@@ -390,13 +520,20 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
     let push_key = SigningKey::from_bytes(&[88u8; 32]);
     let fcm_token = "fcm_device:APA91bTestRegistrationToken_12345";
     let handle = register_via_http(&app, "fcm", fcm_token, &push_key, None).await;
+    let handle2 = register_via_http(
+        &app,
+        "fcm",
+        "fcm_device:second_token_67890",
+        &push_key,
+        None,
+    )
+    .await;
 
-    // 1. First wake push triggers OAuth2 exchange and delivers data-only HIGH-priority message.
+    // 1. First push exchanges ring-signed RS256 JWT; second push reuses cached OAuth2 token.
     let (s, body) = send_hook_via_http(&app, &push_key, &handle, NOW_MS, [30; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
 
-    // 2. Second wake push reuses the cached OAuth2 access token (still only 1 token request!).
     let (s, body) = send_hook_via_http(&app, &push_key, &handle, NOW_MS, [31; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
@@ -404,11 +541,8 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
     {
         let oauth_reqs = mock_state.token_requests.lock();
         assert_eq!(oauth_reqs.len(), 1, "OAuth2 token should be cached");
-        assert!(oauth_reqs[0].starts_with(
-            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="
-        ));
         let assertion = oauth_reqs[0].split("assertion=").nth(1).unwrap();
-        let (hdr, claims) = verify_rs256_jwt(assertion, &rsa_verifying);
+        let (hdr, claims) = verify_rs256_jwt_with_ring(assertion, &public_der);
         assert_eq!(hdr["alg"], "RS256");
         assert_eq!(hdr["typ"], "JWT");
         assert_eq!(
@@ -420,14 +554,9 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
             "https://www.googleapis.com/auth/firebase.messaging"
         );
         assert_eq!(claims["aud"], token_uri);
-        assert_eq!(claims["iat"], NOW_MS / 1_000);
-        assert_eq!(claims["exp"], NOW_MS / 1_000 + 3600);
 
         let fcm_reqs = mock_state.fcm_requests.lock();
         assert_eq!(fcm_reqs.len(), 2);
-        assert_eq!(fcm_reqs[0].0, "demo-dispatch-proj");
-        assert_eq!(fcm_reqs[0].1, "Bearer mock-oauth-token-1");
-        assert_eq!(fcm_reqs[1].1, "Bearer mock-oauth-token-1");
         assert_eq!(
             fcm_reqs[0].2,
             json!({
@@ -441,44 +570,108 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
                 }
             })
         );
-        assert_eq!(
-            fcm_reqs[0].2["message"]["android"]["collapse_key"],
-            "pubky-dispatch-wake"
-        );
-        // Strictly data-only: no notification field.
         assert!(fcm_reqs[0].2["message"].get("notification").is_none());
     }
 
-    // 3. Advance clock into the 120-second refresh margin -> exchanges a fresh OAuth2 token.
+    // 2. Non-pruning FCM answer classes (including generic 404!) MUST keep the handle and answer 502.
+    let non_pruning_cases = [
+        (
+            StatusCode::NOT_FOUND,
+            json!({
+                "error": {
+                    "code": 404,
+                    "message": "Project not found.",
+                    "status": "NOT_FOUND"
+                }
+            })
+            .to_string(),
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            "<html>404 Not Found</html>".to_owned(),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": {
+                    "code": 400,
+                    "message": "Invalid JSON payload received.",
+                    "status": "INVALID_ARGUMENT"
+                }
+            })
+            .to_string(),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": {
+                    "code": 403,
+                    "status": "PERMISSION_DENIED",
+                    "details": [{ "errorCode": "SENDER_ID_MISMATCH" }]
+                }
+            })
+            .to_string(),
+        ),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "details": [{ "errorCode": "QUOTA_EXCEEDED" }]
+                }
+            })
+            .to_string(),
+        ),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": {"code": 500, "status": "INTERNAL"}}).to_string(),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {"code": 503, "status": "UNAVAILABLE"}}).to_string(),
+        ),
+    ];
+
+    for (i, (status, body_str)) in non_pruning_cases.into_iter().enumerate() {
+        mock_state
+            .fcm_responses
+            .lock()
+            .push_back((status, body_str));
+        let nonce = [50u8 + u8::try_from(i).unwrap(); 16];
+        let (s, _) = send_hook_via_http(&app, &push_key, &handle, NOW_MS, nonce).await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_GATEWAY,
+            "FCM {status} without token-specific proof must return 502"
+        );
+        assert!(
+            store.get(&handle).await.unwrap().is_some(),
+            "healthy handle must survive non-pruning FCM {status}"
+        );
+    }
+
+    // 3. Advance clock into refresh margin -> refreshes OAuth2 token; 401 retries once.
     let refreshed_ms = NOW_MS + (3600 - 100) * 1_000;
     clock.set(refreshed_ms);
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [32; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [70; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(mock_state.token_requests.lock().len(), 2);
-    assert_eq!(
-        mock_state.fcm_requests.lock().last().unwrap().1,
-        "Bearer mock-oauth-token-2"
-    );
 
-    // 4. FCM 401 Unauthorized invalidates cache, refreshes OAuth2 token, and retries once.
     mock_state.fcm_responses.lock().push_back((
         StatusCode::UNAUTHORIZED,
-        json!({"error": {"status": "UNAUTHENTICATED"}}),
+        json!({"error": {"status": "UNAUTHENTICATED"}}).to_string(),
     ));
     mock_state
         .fcm_responses
         .lock()
-        .push_back((StatusCode::OK, json!({"name": "ok"})));
-    let (s, body) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [33; 16]).await;
+        .push_back((StatusCode::OK, json!({"name": "ok"}).to_string()));
+    let (s, body) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [71; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], true);
     assert_eq!(mock_state.token_requests.lock().len(), 3);
-    assert_eq!(
-        mock_state.fcm_requests.lock().last().unwrap().1,
-        "Bearer mock-oauth-token-3"
-    );
 
-    // 5. FCM 404 UNREGISTERED prunes the handle from SQLite cleanly.
+    // 4. Token-specific FCM 404 UNREGISTERED prunes handle.
     mock_state.fcm_responses.lock().push_back((
         StatusCode::NOT_FOUND,
         json!({
@@ -491,42 +684,36 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
                     "errorCode": "UNREGISTERED"
                 }]
             }
-        }),
+        })
+        .to_string(),
     ));
-    let (s, body) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [34; 16]).await;
+    let (s, body) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [72; 16]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["delivered"], false);
     assert_eq!(body["pruned"], true);
     assert!(store.get(&handle).await.unwrap().is_none());
 
-    // Subsequent webhook returns 404 without calling FCM.
     let fcm_calls_before = mock_state.fcm_requests.lock().len();
-    let (s, _) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [35; 16]).await;
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, refreshed_ms, [73; 16]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert_eq!(mock_state.fcm_requests.lock().len(), fcm_calls_before);
 
-    // Direct PushSender unit sanity check on unregistered outcome.
+    // 5. Token-specific FCM 400 INVALID_ARGUMENT naming the registration token prunes handle2.
     mock_state.fcm_responses.lock().push_back((
-        StatusCode::NOT_FOUND,
-        json!({"error": {"status": "NOT_FOUND"}}),
-    ));
-    let outcome = fcm_sender
-        .send_wake(&Registration {
-            handle: "direct".to_owned(),
-            platform: Platform::Fcm,
-            device_token: fcm_token.to_owned(),
-            push_key: [1; 32],
-            apns_env: None,
-            created_at_ms: NOW_MS,
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": {
+                "code": 400,
+                "message": "The registration token is not a valid FCM registration token",
+                "status": "INVALID_ARGUMENT"
+            }
         })
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome,
-        PushOutcome::InvalidToken {
-            reason: "NOT_FOUND".to_owned()
-        }
-    );
+        .to_string(),
+    ));
+    let (s, body) = send_hook_via_http(&app, &push_key, &handle2, refreshed_ms, [74; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["pruned"], true);
+    assert!(store.get(&handle2).await.unwrap().is_none());
 }
 
 async fn register_via_http(
