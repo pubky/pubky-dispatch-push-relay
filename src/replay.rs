@@ -1,14 +1,45 @@
-//! Bounded-memory 10-minute nonce replay cache (Wire Format §8.3 rule 5).
+//! 10-minute nonce replay protection abstraction and in-memory cache (Wire Format §8.3 rule 5).
 
 use std::collections::{HashMap, VecDeque};
 
 use parking_lot::Mutex;
+use thiserror::Error;
+
+use crate::store::BoxFuture;
 
 /// Nonce replay window: 10 minutes in milliseconds (Wire Format §8.3 rule 5).
 pub const NONCE_TTL_MS: u64 = 10 * 60 * 1_000;
 
 /// Default maximum number of live nonces retained in memory.
 pub const DEFAULT_MAX_NONCE_ENTRIES: usize = 100_000;
+
+/// Errors returned by [`ReplayStore`] implementations.
+#[derive(Debug, Error)]
+pub enum ReplayError {
+    /// Underlying storage backend error.
+    #[error("replay store backend error: {0}")]
+    Backend(String),
+}
+
+/// Async abstraction for 10-minute webhook nonce replay protection.
+///
+/// Single-instance SQLite deployments use the in-memory [`NonceCache`], while
+/// multi-replica PostgreSQL deployments share an `UNLOGGED` table via
+/// [`crate::store::postgres::PostgresReplayStore`].
+pub trait ReplayStore: Send + Sync {
+    /// Atomically checks whether `nonce` was seen within its TTL at `now_ms`.
+    ///
+    /// Returns `Ok(true)` and records the nonce if unseen (or previously expired);
+    /// returns `Ok(false)` if the nonce is still live (replay).
+    fn check_and_record<'a>(
+        &'a self,
+        nonce: [u8; 16],
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<bool, ReplayError>>;
+
+    /// Prunes entries expired at or before `now_ms`, returning how many were removed.
+    fn prune_expired<'a>(&'a self, now_ms: u64) -> BoxFuture<'a, Result<usize, ReplayError>>;
+}
 
 struct CacheState {
     entries: HashMap<[u8; 16], u64>,
@@ -111,6 +142,20 @@ impl NonceCache {
             }
         }
         evicted
+    }
+}
+
+impl ReplayStore for NonceCache {
+    fn check_and_record<'a>(
+        &'a self,
+        nonce: [u8; 16],
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<bool, ReplayError>> {
+        Box::pin(async move { Ok(Self::check_and_record(self, nonce, now_ms)) })
+    }
+
+    fn prune_expired<'a>(&'a self, now_ms: u64) -> BoxFuture<'a, Result<usize, ReplayError>> {
+        Box::pin(async move { Ok(Self::prune_expired(self, now_ms)) })
     }
 }
 

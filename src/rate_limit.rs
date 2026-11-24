@@ -1,8 +1,12 @@
-//! Per-handle per-minute sliding-window rate limiter (Wire Format §8.3 rule 6).
+//! Sliding-window rate limiting abstraction and in-memory implementation
+//! (Wire Format §8.3 rule 6 and global registration throttling).
 
 use std::collections::{HashMap, VecDeque};
 
 use parking_lot::Mutex;
+use thiserror::Error;
+
+use crate::store::BoxFuture;
 
 /// Rate-limit window duration: 60 seconds in milliseconds.
 pub const RATE_WINDOW_MS: u64 = 60_000;
@@ -12,6 +16,37 @@ pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 60;
 
 /// Default cap on simultaneously tracked handles to bound memory usage.
 pub const DEFAULT_MAX_TRACKED_HANDLES: usize = 100_000;
+
+/// Errors returned by [`RateLimitStore`] implementations.
+#[derive(Debug, Error)]
+pub enum RateLimitError {
+    /// Underlying storage backend error.
+    #[error("rate limit store backend error: {0}")]
+    Backend(String),
+}
+
+/// Async abstraction for sliding-window rate limiting.
+///
+/// Single-instance SQLite deployments use the in-memory [`RateLimiter`], while
+/// multi-replica PostgreSQL deployments share an `UNLOGGED` table via
+/// [`crate::store::postgres::PostgresRateLimitStore`].
+pub trait RateLimitStore: Send + Sync {
+    /// Atomically attempts to consume one slot for `key` at `now_ms`.
+    ///
+    /// Returns `Ok(Ok(()))` if permitted, `Ok(Err(retry_after_secs))` (`>= 1`) when
+    /// the key has reached its limit, or `Err(RateLimitError)` on backend failure.
+    fn check_and_record<'a>(
+        &'a self,
+        key: &'a str,
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<Result<(), u64>, RateLimitError>>;
+
+    /// Removes rate-limit state for `key` (for example after dead-token handle pruning).
+    fn remove_key<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), RateLimitError>>;
+
+    /// Prunes expired rate-limit buckets at `now_ms`, returning how many were removed.
+    fn prune_expired<'a>(&'a self, now_ms: u64) -> BoxFuture<'a, Result<usize, RateLimitError>>;
+}
 
 struct LimiterState {
     buckets: HashMap<String, VecDeque<u64>>,
@@ -139,6 +174,27 @@ impl RateLimiter {
         if let Some(key) = oldest_key {
             state.buckets.remove(&key);
         }
+    }
+}
+
+impl RateLimitStore for RateLimiter {
+    fn check_and_record<'a>(
+        &'a self,
+        key: &'a str,
+        now_ms: u64,
+    ) -> BoxFuture<'a, Result<Result<(), u64>, RateLimitError>> {
+        Box::pin(async move { Ok(Self::check_and_record(self, key, now_ms)) })
+    }
+
+    fn remove_key<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), RateLimitError>> {
+        Box::pin(async move {
+            Self::remove_handle(self, key);
+            Ok(())
+        })
+    }
+
+    fn prune_expired<'a>(&'a self, now_ms: u64) -> BoxFuture<'a, Result<usize, RateLimitError>> {
+        Box::pin(async move { Ok(Self::prune_expired(self, now_ms)) })
     }
 }
 

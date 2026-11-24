@@ -40,7 +40,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
-    name: Test
+    name: Test (SQLite)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -49,6 +49,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
       - run: cargo test --doc --locked
+
+  test-postgres:
+    name: Test (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://relay:relay@127.0.0.1:5432/relay_test
+      REQUIRE_POSTGRES_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --locked
 
   doc:
     name: Docs

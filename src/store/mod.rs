@@ -1,8 +1,9 @@
-//! Registration persistence abstraction.
+//! Registration persistence abstraction and SQLite/PostgreSQL backends.
 //!
-//! Defines [`RegistrationStore`] so SQLite is used out of the box and additional backends
-//! (such as PostgreSQL) can be plugged in without changing HTTP or push logic.
+//! Defines [`RegistrationStore`] with SQLite as the zero-config single-instance default
+//! and PostgreSQL for stateless multi-replica deployments.
 
+pub mod postgres;
 pub mod sqlite;
 
 use std::fmt;
@@ -12,6 +13,13 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Returns `true` when `database_url` selects the PostgreSQL backend (`postgres://` or
+/// `postgresql://`). Any other value selects SQLite.
+#[must_use]
+pub fn is_postgres_url(database_url: &str) -> bool {
+    database_url.starts_with("postgres://") || database_url.starts_with("postgresql://")
+}
 
 /// Boxed `Send` future for object-safe async storage methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -195,5 +203,14 @@ mod tests {
         assert!(!rendered.contains("deadbeef"));
         assert!(!rendered.contains("66, 66"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn detects_postgres_and_sqlite_urls() {
+        assert!(is_postgres_url("postgres://user:pass@localhost:5432/relay"));
+        assert!(is_postgres_url("postgresql://localhost/relay"));
+        assert!(!is_postgres_url("./data/push-relay.sqlite"));
+        assert!(!is_postgres_url("sqlite://relay.db"));
+        assert!(!is_postgres_url(":memory:"));
     }
 }

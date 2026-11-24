@@ -149,11 +149,11 @@ All options can be passed via environment variables or CLI flags (`--help` print
 |---|---|---|
 | `RELAY_ORIGIN` | *(required)* | Canonical public origin (`https://<host>`, no port or path) verified in webhook signatures. |
 | `RELAY_BIND_ADDR` | `0.0.0.0:8080` | TCP socket address to bind the HTTP listener. |
-| `DATABASE_URL` | `./data/push-relay.sqlite` | SQLite file path, `sqlite://...` URL, or `:memory:`. Parent directories are created automatically. |
+| `DATABASE_URL` | `./data/push-relay.sqlite` | Backend auto-selected by URL: `postgres://` or `postgresql://` enables PostgreSQL multi-replica mode; any other path/URL (`./data/push-relay.sqlite`, `sqlite://...`, `:memory:`) uses SQLite. |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Maximum wake pushes per handle per rolling 60-second window. |
 | `REGISTER_RATE_LIMIT_PER_MINUTE` | `120` | Global maximum `POST /v1/register` requests per rolling 60-second window (`429` with `Retry-After` when exceeded). |
 | `MAX_REGISTRATIONS` | `1000000` | Maximum total registrations stored before rejecting new registrations with `503`. |
-| `NONCE_CACHE_MAX_ENTRIES` | `100000` | Maximum entries retained in the 10-minute nonce replay cache. |
+| `NONCE_CACHE_MAX_ENTRIES` | `100000` | Maximum entries retained in the in-memory 10-minute nonce replay cache (SQLite mode). |
 | `PUSH_BACKEND` | `providers` | `providers` (APNs/FCM) or `noop` (for local development without Apple/Google credentials). |
 | `LOG_FORMAT` | `json` | `json` or `pretty`. Filter level controlled via `RUST_LOG`. |
 | `APNS_TEAM_ID` | — | 10-character Apple Developer Team ID (`iss`). |
@@ -200,6 +200,31 @@ docker run --rm -p 8080:8080 \
 
 ## Production Deployment
 
+### Multi-Replica Stateless Deployment (PostgreSQL)
+
+Point `DATABASE_URL` at a shared PostgreSQL instance (`postgres://...` or `postgresql://...`) to run multiple stateless replicas behind a load balancer without needing Redis:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e RELAY_ORIGIN=https://push.example.com \
+  -e DATABASE_URL=postgres://relay:secret@postgres.internal:5432/push_relay \
+  -e APNS_TEAM_ID=TEAM123456 \
+  -e APNS_KEY_ID=KEY1234567 \
+  -e APNS_BUNDLE_ID=to.bitkit.app \
+  -e APNS_KEY_PEM="$APNS_P8_BASE64" \
+  -e FCM_SERVICE_ACCOUNT_JSON="$FCM_SA_BASE64" \
+  pubky-dispatch-push-relay
+```
+
+When running on PostgreSQL:
+
+- **`registrations`** persists handle mappings and enforces `MAX_REGISTRATIONS` atomically across all replicas using a transaction-scoped advisory lock (`pg_advisory_xact_lock`).
+- **`webhook_nonces` (`UNLOGGED`)** provides atomic cross-replica 10-minute nonce replay protection (`409`) without WAL overhead.
+- **`rate_limit_buckets` (`UNLOGGED`)** provides atomic cross-replica sliding-window rate limiting (`429`) for both per-handle hooks and global registrations.
+- Each replica's existing 60-second background sweep task prunes expired rows from both `UNLOGGED` tables automatically.
+
+### Unauthenticated `/v1/register` Hardening
+
 Because `POST /v1/register` is intentionally unauthenticated (clients submit only a device token and an opaque `push_key` with no user account), combine application-level and edge protections in production:
 
 - **Application limits:** Tune `REGISTER_RATE_LIMIT_PER_MINUTE` (default `120`) and `MAX_REGISTRATIONS` (default `1000000`) to bound write throughput and disk usage.
@@ -209,7 +234,10 @@ Because `POST /v1/register` is intentionally unauthenticated (clients submit onl
 
 ## Storage Backends
 
-Registrations are stored behind the `RegistrationStore` trait (`src/store/mod.rs`). SQLite (`src/store/sqlite.rs`) ships enabled by default using WAL journal mode and strict typing. Alternative backends (such as PostgreSQL) can be added by implementing `RegistrationStore` without modifying HTTP handlers, cryptography, or push delivery code.
+Persistence, replay protection, and rate limiting sit behind clean async traits (`RegistrationStore`, `ReplayStore`, and `RateLimitStore`):
+
+- **SQLite (default):** Zero-config single-instance mode using WAL journal mode (`STRICT` table) with fast bounded in-memory replay cache and rate limiters.
+- **PostgreSQL (`DATABASE_URL=postgres://...` / `postgresql://...`):** Stateless multi-replica mode sharing persistent registrations plus `UNLOGGED` replay and rate-limit tables over a single `sqlx` connection pool (TLS via `rustls`).
 
 ## Development & Verification
 
@@ -218,6 +246,14 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 cargo doc --no-deps
+```
+
+To run the PostgreSQL and multi-replica integration tests locally against a Postgres instance:
+
+```bash
+TEST_DATABASE_URL=postgres://relay:relay@127.0.0.1:5432/relay_test \
+REQUIRE_POSTGRES_TESTS=1 \
+cargo test --test postgres
 ```
 
 ## License

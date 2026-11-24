@@ -17,8 +17,8 @@ use crate::crypto::{
 use crate::error::ApiError;
 use crate::json::{check_strict_json, parse_strict_json};
 use crate::push::{PushError, PushOutcome, PushSender};
-use crate::rate_limit::RateLimiter;
-use crate::replay::{NONCE_TTL_MS, NonceCache};
+use crate::rate_limit::{RateLimitStore, RateLimiter};
+use crate::replay::{NONCE_TTL_MS, NonceCache, ReplayStore};
 use crate::store::{ApnsEnv, Platform, Registration, RegistrationStore, StoreError};
 use crate::time::parse_rfc3339;
 
@@ -37,9 +37,9 @@ pub struct RelayState {
     store: Arc<dyn RegistrationStore>,
     push: Arc<dyn PushSender>,
     clock: Arc<dyn Clock>,
-    replay: Arc<NonceCache>,
-    rate_limiter: Arc<RateLimiter>,
-    register_rate_limiter: Arc<RateLimiter>,
+    replay: Arc<dyn ReplayStore>,
+    rate_limiter: Arc<dyn RateLimitStore>,
+    register_rate_limiter: Arc<dyn RateLimitStore>,
     settings: Arc<RelaySettings>,
 }
 
@@ -47,15 +47,13 @@ impl std::fmt::Debug for RelayState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RelayState")
             .field("settings", &self.settings)
-            .field("replay", &self.replay)
-            .field("rate_limiter", &self.rate_limiter)
-            .field("register_rate_limiter", &self.register_rate_limiter)
             .finish()
     }
 }
 
 impl RelayState {
-    /// Creates a new [`RelayState`] with fresh replay cache and rate limiters.
+    /// Creates a new [`RelayState`] using in-memory replay cache and rate limiters
+    /// (suitable for single-instance SQLite deployments and tests).
     #[must_use]
     pub fn new(
         store: Arc<dyn RegistrationStore>,
@@ -63,16 +61,39 @@ impl RelayState {
         clock: Arc<dyn Clock>,
         settings: RelaySettings,
     ) -> Self {
-        let replay = Arc::new(NonceCache::new(
+        let replay: Arc<dyn ReplayStore> = Arc::new(NonceCache::new(
             NONCE_TTL_MS,
             settings.nonce_cache_max_entries,
         ));
-        let rate_limiter = Arc::new(RateLimiter::new(
+        let rate_limiter: Arc<dyn RateLimitStore> = Arc::new(RateLimiter::new(
             settings.rate_limit_per_minute,
             settings.rate_limit_max_handles,
         ));
-        let register_rate_limiter =
+        let register_rate_limiter: Arc<dyn RateLimitStore> =
             Arc::new(RateLimiter::new(settings.register_rate_limit_per_minute, 1));
+        Self::with_backends(
+            store,
+            push,
+            clock,
+            replay,
+            rate_limiter,
+            register_rate_limiter,
+            settings,
+        )
+    }
+
+    /// Creates a new [`RelayState`] with custom [`ReplayStore`] and [`RateLimitStore`]
+    /// implementations (for example PostgreSQL backends in multi-replica deployments).
+    #[must_use]
+    pub fn with_backends(
+        store: Arc<dyn RegistrationStore>,
+        push: Arc<dyn PushSender>,
+        clock: Arc<dyn Clock>,
+        replay: Arc<dyn ReplayStore>,
+        rate_limiter: Arc<dyn RateLimitStore>,
+        register_rate_limiter: Arc<dyn RateLimitStore>,
+        settings: RelaySettings,
+    ) -> Self {
         Self {
             store,
             push,
@@ -84,17 +105,31 @@ impl RelayState {
         }
     }
 
-    /// Prunes expired entries from the in-memory replay cache and rate limiters.
-    pub fn prune_caches(&self) {
+    /// Prunes expired entries from the replay store and rate limiters.
+    pub async fn prune_caches(&self) {
         let now_ms = self.clock.now_ms();
-        let evicted_nonces = self.replay.prune_expired(now_ms);
-        let evicted_handles = self.rate_limiter.prune_expired(now_ms);
-        let _ = self.register_rate_limiter.prune_expired(now_ms);
+        let evicted_nonces = match self.replay.prune_expired(now_ms).await {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to prune expired replay nonces");
+                0
+            }
+        };
+        let evicted_handles = match self.rate_limiter.prune_expired(now_ms).await {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to prune expired hook rate limits");
+                0
+            }
+        };
+        if let Err(err) = self.register_rate_limiter.prune_expired(now_ms).await {
+            tracing::warn!(error = %err, "failed to prune expired registration rate limits");
+        }
         if evicted_nonces > 0 || evicted_handles > 0 {
             tracing::debug!(
                 evicted_nonces,
                 evicted_handles,
-                "pruned expired in-memory cache entries"
+                "pruned expired replay and rate-limit entries"
             );
         }
     }
@@ -105,15 +140,15 @@ impl RelayState {
         &self.store
     }
 
-    /// Returns a reference to the [`NonceCache`].
+    /// Returns a reference to the [`ReplayStore`].
     #[must_use]
-    pub fn replay_cache(&self) -> &Arc<NonceCache> {
+    pub fn replay_store(&self) -> &Arc<dyn ReplayStore> {
         &self.replay
     }
 
-    /// Returns a reference to the per-handle [`RateLimiter`].
+    /// Returns a reference to the per-handle [`RateLimitStore`].
     #[must_use]
-    pub fn rate_limiter(&self) -> &Arc<RateLimiter> {
+    pub fn rate_limiter(&self) -> &Arc<dyn RateLimitStore> {
         &self.rate_limiter
     }
 }
@@ -187,14 +222,22 @@ async fn handle_register(
     body: Body,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
     let created_at_ms = state.clock.now_ms();
-    if let Err(retry_after) = state
+    match state
         .register_rate_limiter
         .check_and_record("register", created_at_ms)
+        .await
     {
-        return Err(ApiError::rate_limited_with_message(
-            retry_after,
-            "registration rate limit exceeded",
-        ));
+        Ok(Ok(())) => {}
+        Ok(Err(retry_after)) => {
+            return Err(ApiError::rate_limited_with_message(
+                retry_after,
+                "registration rate limit exceeded",
+            ));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "registration rate-limit check failed");
+            return Err(ApiError::internal());
+        }
     }
 
     let raw = read_bounded_body(body, state.settings.max_body_bytes).await?;
@@ -313,13 +356,27 @@ async fn handle_hook(
     }
 
     // Rule 5 (Wire Format §8.3): nonce unseen in the last 10 minutes (else 409).
-    if !state.replay.check_and_record(nonce, now_ms) {
-        return Err(ApiError::nonce_replay());
+    match state.replay.check_and_record(nonce, now_ms).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ApiError::nonce_replay()),
+        Err(err) => {
+            tracing::error!(error = %err, "replay cache lookup failed on webhook");
+            return Err(ApiError::internal());
+        }
     }
 
     // Rule 6 (Wire Format §8.3): per-handle per-minute rate limit (else 429).
-    if let Err(retry_after) = state.rate_limiter.check_and_record(&webhook.handle, now_ms) {
-        return Err(ApiError::rate_limited(retry_after));
+    match state
+        .rate_limiter
+        .check_and_record(&webhook.handle, now_ms)
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(retry_after)) => return Err(ApiError::rate_limited(retry_after)),
+        Err(err) => {
+            tracing::error!(error = %err, "rate-limit check failed on webhook");
+            return Err(ApiError::internal());
+        }
     }
 
     // Dispatch content-free wake push to APNs or FCM.
@@ -343,7 +400,13 @@ async fn handle_hook(
                 );
                 return Err(ApiError::internal());
             }
-            state.rate_limiter.remove_handle(&registration.handle);
+            if let Err(err) = state.rate_limiter.remove_key(&registration.handle).await {
+                tracing::warn!(
+                    platform = %registration.platform,
+                    error = %err,
+                    "failed to clear rate-limit state for pruned handle"
+                );
+            }
             tracing::info!(
                 platform = %registration.platform,
                 reason = %reason,

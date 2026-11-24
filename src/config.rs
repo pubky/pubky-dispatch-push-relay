@@ -13,7 +13,7 @@ use crate::push::apns::{ApnsConfig, ApnsPushMode};
 use crate::push::fcm::{FcmConfig, FcmServiceAccount};
 use crate::rate_limit::{DEFAULT_MAX_TRACKED_HANDLES, DEFAULT_RATE_LIMIT_PER_MINUTE};
 use crate::replay::DEFAULT_MAX_NONCE_ENTRIES;
-use crate::store::ApnsEnv;
+use crate::store::{ApnsEnv, is_postgres_url};
 
 /// Default maximum HTTP request body size (16 KiB).
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024;
@@ -200,7 +200,9 @@ pub struct CliArgs {
     #[arg(long, env = "RELAY_ORIGIN")]
     pub relay_origin: String,
 
-    /// SQLite database path or URL (e.g. `./data/push-relay.sqlite` or `:memory:`).
+    /// Database path or connection URL: `postgres://` / `postgresql://` selects
+    /// PostgreSQL (multi-replica mode); any other value selects SQLite
+    /// (e.g. `./data/push-relay.sqlite` or `:memory:`).
     #[arg(long, env = "DATABASE_URL", default_value = "./data/push-relay.sqlite")]
     pub database_url: String,
 
@@ -275,10 +277,15 @@ pub struct CliArgs {
 
 impl std::fmt::Debug for CliArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db_backend = if is_postgres_url(&self.database_url) {
+            "postgres://<redacted>"
+        } else {
+            "<sqlite>"
+        };
         f.debug_struct("CliArgs")
             .field("bind_addr", &self.bind_addr)
             .field("relay_origin", &self.relay_origin)
-            .field("database_url", &self.database_url)
+            .field("database_url", &db_backend)
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)
             .field(
                 "register_rate_limit_per_minute",
@@ -498,5 +505,17 @@ mod tests {
         ])
         .unwrap();
         assert!(partial_apns.load_apns_config().is_err());
+
+        let pg_cli = CliArgs::try_parse_from([
+            "pubky-dispatch-push-relay",
+            "--relay-origin",
+            "https://push.example",
+            "--database-url",
+            "postgres://relay:super_secret_pw@db.internal:5432/push",
+        ])
+        .unwrap();
+        let debug = format!("{pg_cli:?}");
+        assert!(!debug.contains("super_secret_pw"));
+        assert!(debug.contains("postgres://<redacted>"));
     }
 }

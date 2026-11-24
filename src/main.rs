@@ -17,6 +17,12 @@ use pubky_dispatch_push_relay::push::apns::ApnsSender;
 use pubky_dispatch_push_relay::push::fcm::FcmSender;
 use pubky_dispatch_push_relay::push::noop::NoopSender;
 use pubky_dispatch_push_relay::push::{PushSender, RouterPushSender};
+use pubky_dispatch_push_relay::rate_limit::RateLimitStore;
+use pubky_dispatch_push_relay::replay::ReplayStore;
+use pubky_dispatch_push_relay::store::is_postgres_url;
+use pubky_dispatch_push_relay::store::postgres::{
+    PostgresRateLimitStore, PostgresReplayStore, PostgresStore,
+};
 use pubky_dispatch_push_relay::store::sqlite::SqliteStore;
 
 #[tokio::main]
@@ -35,7 +41,6 @@ async fn main() -> ExitCode {
 
 async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let settings = args.to_relay_settings()?;
-    let store = Arc::new(SqliteStore::open(&args.database_url).await?);
 
     let push_sender: Arc<dyn PushSender> = match args.push_backend {
         PushBackendMode::Noop => {
@@ -69,7 +74,42 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let state = RelayState::new(store, push_sender, Arc::new(SystemClock), settings.clone());
+    let clock = Arc::new(SystemClock);
+    let state = if is_postgres_url(&args.database_url) {
+        let pg_store = Arc::new(PostgresStore::open(&args.database_url).await?);
+        let pool = pg_store.pool().clone();
+        let replay: Arc<dyn ReplayStore> = Arc::new(PostgresReplayStore::new(pool.clone()).await?);
+        let hook_limiter: Arc<dyn RateLimitStore> = Arc::new(
+            PostgresRateLimitStore::new(pool.clone(), "hook", settings.rate_limit_per_minute)
+                .await?,
+        );
+        let register_limiter: Arc<dyn RateLimitStore> = Arc::new(
+            PostgresRateLimitStore::new(pool, "register", settings.register_rate_limit_per_minute)
+                .await?,
+        );
+        tracing::info!(
+            storage = "postgres",
+            coordination = "postgres_unlogged",
+            "initialized multi-replica PostgreSQL backend"
+        );
+        RelayState::with_backends(
+            pg_store,
+            push_sender,
+            clock,
+            replay,
+            hook_limiter,
+            register_limiter,
+            settings.clone(),
+        )
+    } else {
+        let sqlite_store = Arc::new(SqliteStore::open(&args.database_url).await?);
+        tracing::info!(
+            storage = "sqlite",
+            coordination = "in_memory",
+            "initialized single-instance SQLite backend"
+        );
+        RelayState::new(sqlite_store, push_sender, clock, settings.clone())
+    };
 
     let sweep_state = state.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -77,7 +117,7 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             tokio::select! {
-                _ = interval.tick() => sweep_state.prune_caches(),
+                _ = interval.tick() => sweep_state.prune_caches().await,
                 _ = shutdown_rx.changed() => break,
             }
         }
