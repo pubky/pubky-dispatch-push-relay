@@ -18,6 +18,12 @@ use crate::store::ApnsEnv;
 /// Default maximum HTTP request body size (16 KiB).
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024;
 
+/// Default global rate limit for `POST /v1/register` (requests per minute).
+pub const DEFAULT_REGISTER_RATE_LIMIT_PER_MINUTE: u32 = 120;
+
+/// Default maximum total registrations stored before rejecting new registrations with `503`.
+pub const DEFAULT_MAX_REGISTRATIONS: u64 = 1_000_000;
+
 /// Configuration validation errors.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -84,6 +90,10 @@ pub struct RelaySettings {
     pub default_apns_env: ApnsEnv,
     /// Maximum wake pushes permitted per handle per minute.
     pub rate_limit_per_minute: u32,
+    /// Global maximum `POST /v1/register` requests permitted per minute.
+    pub register_rate_limit_per_minute: u32,
+    /// Maximum total registrations retained in storage before returning `503`.
+    pub max_registrations: u64,
     /// Maximum entries kept in the 10-minute nonce replay cache.
     pub nonce_cache_max_entries: usize,
     /// Maximum simultaneously tracked handles in the rate limiter.
@@ -107,6 +117,8 @@ impl RelaySettings {
             protocol: ProtocolConfig::dispatch(),
             default_apns_env: ApnsEnv::Production,
             rate_limit_per_minute: DEFAULT_RATE_LIMIT_PER_MINUTE,
+            register_rate_limit_per_minute: DEFAULT_REGISTER_RATE_LIMIT_PER_MINUTE,
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
             nonce_cache_max_entries: DEFAULT_MAX_NONCE_ENTRIES,
             rate_limit_max_handles: DEFAULT_MAX_TRACKED_HANDLES,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -196,6 +208,22 @@ pub struct CliArgs {
     #[arg(long, env = "RATE_LIMIT_PER_MINUTE", default_value_t = DEFAULT_RATE_LIMIT_PER_MINUTE)]
     pub rate_limit_per_minute: u32,
 
+    /// Global maximum `POST /v1/register` requests per minute.
+    #[arg(
+        long,
+        env = "REGISTER_RATE_LIMIT_PER_MINUTE",
+        default_value_t = DEFAULT_REGISTER_RATE_LIMIT_PER_MINUTE
+    )]
+    pub register_rate_limit_per_minute: u32,
+
+    /// Maximum total registrations stored before rejecting new registrations with `503`.
+    #[arg(
+        long,
+        env = "MAX_REGISTRATIONS",
+        default_value_t = DEFAULT_MAX_REGISTRATIONS
+    )]
+    pub max_registrations: u64,
+
     /// Maximum entries kept in the 10-minute nonce replay cache.
     #[arg(long, env = "NONCE_CACHE_MAX_ENTRIES", default_value_t = DEFAULT_MAX_NONCE_ENTRIES)]
     pub nonce_cache_max_entries: usize,
@@ -252,6 +280,11 @@ impl std::fmt::Debug for CliArgs {
             .field("relay_origin", &self.relay_origin)
             .field("database_url", &self.database_url)
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field(
+                "register_rate_limit_per_minute",
+                &self.register_rate_limit_per_minute,
+            )
+            .field("max_registrations", &self.max_registrations)
             .field("nonce_cache_max_entries", &self.nonce_cache_max_entries)
             .field("push_backend", &self.push_backend)
             .field("log_format", &self.log_format)
@@ -276,6 +309,8 @@ impl CliArgs {
         let mut settings = RelaySettings::new(&self.relay_origin)?;
         settings.default_apns_env = self.apns_default_env.into();
         settings.rate_limit_per_minute = self.rate_limit_per_minute;
+        settings.register_rate_limit_per_minute = self.register_rate_limit_per_minute;
+        settings.max_registrations = self.max_registrations;
         settings.nonce_cache_max_entries = self.nonce_cache_max_entries;
         Ok(settings)
     }
@@ -441,12 +476,16 @@ mod tests {
             "https://push.example",
             "--push-backend",
             "noop",
+            "--register-rate-limit-per-minute",
+            "250",
+            "--max-registrations",
+            "50000",
         ])
         .unwrap();
-        assert_eq!(
-            ok.to_relay_settings().unwrap().relay_origin,
-            "https://push.example"
-        );
+        let settings = ok.to_relay_settings().unwrap();
+        assert_eq!(settings.relay_origin, "https://push.example");
+        assert_eq!(settings.register_rate_limit_per_minute, 250);
+        assert_eq!(settings.max_registrations, 50_000);
         assert!(ok.load_apns_config().unwrap().is_none());
         assert!(ok.load_fcm_config().unwrap().is_none());
 

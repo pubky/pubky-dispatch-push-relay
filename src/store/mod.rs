@@ -136,6 +136,9 @@ pub enum StoreError {
     /// A registration with the same handle already exists.
     #[error("registration handle already exists")]
     DuplicateHandle,
+    /// Store has reached its configured maximum registration capacity.
+    #[error("registration store has reached its maximum capacity")]
+    CapacityExceeded,
     /// Persisted database row contained invalid or corrupted values.
     #[error("corrupt storage record: {0}")]
     CorruptData(String),
@@ -147,13 +150,17 @@ pub enum StoreError {
 /// Storage trait for opaque handle registrations.
 ///
 /// Implementations must guarantee that registering a new handle never overwrites or
-/// redirects an existing handle.
+/// redirects an existing handle, and must enforce `max_registrations` atomically when set.
 pub trait RegistrationStore: Send + Sync {
-    /// Persists a new registration. Fails with [`StoreError::DuplicateHandle`] if the
-    /// handle already exists.
+    /// Persists a new registration, atomically enforcing `max_registrations` when `Some`.
+    ///
+    /// Fails with [`StoreError::DuplicateHandle`] if the handle already exists, or
+    /// [`StoreError::CapacityExceeded`] if the store already holds at least
+    /// `max_registrations` entries.
     fn insert<'a>(
         &'a self,
         registration: &'a Registration,
+        max_registrations: Option<u64>,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Looks up a registration by its opaque handle.

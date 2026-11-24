@@ -28,6 +28,9 @@ pub const DEFAULT_GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token"
 /// Required OAuth2 scope for FCM HTTP v1.
 const FCM_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 
+/// Collapse key used to coalesce queued Android wake pushes while a device is offline.
+pub const FCM_COLLAPSE_KEY: &str = "pubky-dispatch-wake";
+
 /// Refresh cached OAuth2 access tokens this many seconds before expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 120;
 
@@ -133,6 +136,7 @@ struct FcmWakeData {
 
 #[derive(Serialize)]
 struct FcmAndroidConfig {
+    collapse_key: &'static str,
     priority: &'static str,
 }
 
@@ -328,7 +332,10 @@ impl FcmSender {
                     kind: "wake",
                     v: "1",
                 },
-                android: FcmAndroidConfig { priority: "HIGH" },
+                android: FcmAndroidConfig {
+                    collapse_key: FCM_COLLAPSE_KEY,
+                    priority: "HIGH",
+                },
             },
         };
 

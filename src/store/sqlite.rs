@@ -92,27 +92,48 @@ impl RegistrationStore for SqliteStore {
     fn insert<'a>(
         &'a self,
         registration: &'a Registration,
+        max_registrations: Option<u64>,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             let created_at_ms = i64::try_from(registration.created_at_ms)
                 .map_err(|_| StoreError::CorruptData("created_at_ms overflows i64".to_owned()))?;
             let apns_env = registration.apns_env.map(ApnsEnv::as_str);
 
-            let result = sqlx::query(
-                "INSERT INTO registrations \
-                 (handle, platform, device_token, push_key, apns_env, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )
-            .bind(&registration.handle)
-            .bind(registration.platform.as_str())
-            .bind(&registration.device_token)
-            .bind(registration.push_key.as_slice())
-            .bind(apns_env)
-            .bind(created_at_ms)
-            .execute(&self.pool)
-            .await;
+            let result = if let Some(cap) = max_registrations {
+                let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
+                sqlx::query(
+                    "INSERT INTO registrations \
+                     (handle, platform, device_token, push_key, apns_env, created_at_ms) \
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+                     WHERE (SELECT COUNT(*) FROM registrations) < ?7",
+                )
+                .bind(&registration.handle)
+                .bind(registration.platform.as_str())
+                .bind(&registration.device_token)
+                .bind(registration.push_key.as_slice())
+                .bind(apns_env)
+                .bind(created_at_ms)
+                .bind(cap_i64)
+                .execute(&self.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "INSERT INTO registrations \
+                     (handle, platform, device_token, push_key, apns_env, created_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .bind(&registration.handle)
+                .bind(registration.platform.as_str())
+                .bind(&registration.device_token)
+                .bind(registration.push_key.as_slice())
+                .bind(apns_env)
+                .bind(created_at_ms)
+                .execute(&self.pool)
+                .await
+            };
 
             match result {
+                Ok(done) if done.rows_affected() == 0 => Err(StoreError::CapacityExceeded),
                 Ok(_) => Ok(()),
                 Err(sqlx::Error::Database(db_err))
                     if db_err.is_unique_violation()
@@ -223,19 +244,19 @@ mod tests {
         store.ping().await.unwrap();
 
         let reg = sample("handle-1");
-        store.insert(&reg).await.unwrap();
+        store.insert(&reg, None).await.unwrap();
 
         let loaded = store.get("handle-1").await.unwrap().unwrap();
         assert_eq!(loaded, reg);
 
         assert!(matches!(
-            store.insert(&reg).await,
+            store.insert(&reg, None).await,
             Err(StoreError::DuplicateHandle)
         ));
 
         // Same device token under a distinct handle is allowed (fresh handle, no redirection).
         let second = sample("handle-2");
-        store.insert(&second).await.unwrap();
+        store.insert(&second, None).await.unwrap();
         assert_eq!(store.get("handle-1").await.unwrap().unwrap(), reg);
         assert_eq!(store.get("handle-2").await.unwrap().unwrap(), second);
 
@@ -243,6 +264,29 @@ mod tests {
         assert!(!store.delete("handle-1").await.unwrap());
         assert!(store.get("handle-1").await.unwrap().is_none());
         assert!(store.get("handle-2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn enforces_max_registrations_cap_and_reclaims_space_on_delete() {
+        let store = SqliteStore::in_memory().await.unwrap();
+
+        // Cap of 0 rejects immediately.
+        assert!(matches!(
+            store.insert(&sample("h0"), Some(0)).await,
+            Err(StoreError::CapacityExceeded)
+        ));
+
+        store.insert(&sample("h1"), Some(2)).await.unwrap();
+        store.insert(&sample("h2"), Some(2)).await.unwrap();
+        assert!(matches!(
+            store.insert(&sample("h3"), Some(2)).await,
+            Err(StoreError::CapacityExceeded)
+        ));
+
+        // Deleting a handle frees capacity for a subsequent registration.
+        assert!(store.delete("h1").await.unwrap());
+        store.insert(&sample("h3"), Some(2)).await.unwrap();
+        assert!(store.get("h3").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -254,7 +298,7 @@ mod tests {
         let reg = sample("disk-handle");
         {
             let store = SqliteStore::open(path_str).await.unwrap();
-            store.insert(&reg).await.unwrap();
+            store.insert(&reg, None).await.unwrap();
         }
         let reopened = SqliteStore::open(path_str).await.unwrap();
         assert_eq!(reopened.get("disk-handle").await.unwrap().unwrap(), reg);

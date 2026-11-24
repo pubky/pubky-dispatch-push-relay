@@ -39,6 +39,7 @@ pub struct RelayState {
     clock: Arc<dyn Clock>,
     replay: Arc<NonceCache>,
     rate_limiter: Arc<RateLimiter>,
+    register_rate_limiter: Arc<RateLimiter>,
     settings: Arc<RelaySettings>,
 }
 
@@ -48,12 +49,13 @@ impl std::fmt::Debug for RelayState {
             .field("settings", &self.settings)
             .field("replay", &self.replay)
             .field("rate_limiter", &self.rate_limiter)
+            .field("register_rate_limiter", &self.register_rate_limiter)
             .finish()
     }
 }
 
 impl RelayState {
-    /// Creates a new [`RelayState`] with fresh replay cache and per-handle rate limiter.
+    /// Creates a new [`RelayState`] with fresh replay cache and rate limiters.
     #[must_use]
     pub fn new(
         store: Arc<dyn RegistrationStore>,
@@ -69,21 +71,25 @@ impl RelayState {
             settings.rate_limit_per_minute,
             settings.rate_limit_max_handles,
         ));
+        let register_rate_limiter =
+            Arc::new(RateLimiter::new(settings.register_rate_limit_per_minute, 1));
         Self {
             store,
             push,
             clock,
             replay,
             rate_limiter,
+            register_rate_limiter,
             settings: Arc::new(settings),
         }
     }
 
-    /// Prunes expired entries from the in-memory replay cache and rate limiter.
+    /// Prunes expired entries from the in-memory replay cache and rate limiters.
     pub fn prune_caches(&self) {
         let now_ms = self.clock.now_ms();
         let evicted_nonces = self.replay.prune_expired(now_ms);
         let evicted_handles = self.rate_limiter.prune_expired(now_ms);
+        let _ = self.register_rate_limiter.prune_expired(now_ms);
         if evicted_nonces > 0 || evicted_handles > 0 {
             tracing::debug!(
                 evicted_nonces,
@@ -180,6 +186,17 @@ async fn handle_register(
     State(state): State<RelayState>,
     body: Body,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
+    let created_at_ms = state.clock.now_ms();
+    if let Err(retry_after) = state
+        .register_rate_limiter
+        .check_and_record("register", created_at_ms)
+    {
+        return Err(ApiError::rate_limited_with_message(
+            retry_after,
+            "registration rate limit exceeded",
+        ));
+    }
+
     let raw = read_bounded_body(body, state.settings.max_body_bytes).await?;
     let req: RegisterRequest =
         parse_strict_json(&raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -202,8 +219,6 @@ async fn handle_register(
     validate_public_key(&push_key)
         .map_err(|e| ApiError::bad_request(format!("invalid push_key: {e}")))?;
 
-    let created_at_ms = state.clock.now_ms();
-
     for _ in 0..MAX_HANDLE_GENERATION_ATTEMPTS {
         let handle = generate_handle().map_err(|err| {
             tracing::error!(error = %err, "failed to generate random handle");
@@ -218,12 +233,20 @@ async fn handle_register(
             created_at_ms,
         };
 
-        match state.store.insert(&registration).await {
+        match state
+            .store
+            .insert(&registration, Some(state.settings.max_registrations))
+            .await
+        {
             Ok(()) => {
                 tracing::info!(platform = %req.platform, "registered push handle");
                 return Ok((StatusCode::OK, Json(RegisterResponse { handle })));
             }
             Err(StoreError::DuplicateHandle) => continue,
+            Err(StoreError::CapacityExceeded) => {
+                tracing::warn!("rejected registration: maximum registration capacity reached");
+                return Err(ApiError::unavailable("registration capacity exceeded"));
+            }
             Err(err) => {
                 tracing::error!(error = %err, "failed to persist push registration");
                 return Err(ApiError::internal());

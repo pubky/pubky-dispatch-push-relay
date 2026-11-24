@@ -434,9 +434,16 @@ async fn fcm_exchanges_rs256_oauth_caches_token_sends_data_only_and_prunes_unreg
                 "message": {
                     "token": fcm_token,
                     "data": { "type": "wake", "v": "1" },
-                    "android": { "priority": "HIGH" }
+                    "android": {
+                        "collapse_key": "pubky-dispatch-wake",
+                        "priority": "HIGH"
+                    }
                 }
             })
+        );
+        assert_eq!(
+            fcm_reqs[0].2["message"]["android"]["collapse_key"],
+            "pubky-dispatch-wake"
         );
         // Strictly data-only: no notification field.
         assert!(fcm_reqs[0].2["message"].get("notification").is_none());

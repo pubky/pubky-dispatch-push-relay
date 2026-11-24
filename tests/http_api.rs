@@ -128,7 +128,11 @@ fn apns_token(ch: char) -> String {
 struct FailingStore;
 
 impl RegistrationStore for FailingStore {
-    fn insert<'a>(&'a self, _: &'a Registration) -> BoxFuture<'a, Result<(), StoreError>> {
+    fn insert<'a>(
+        &'a self,
+        _: &'a Registration,
+        _: Option<u64>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async { Err(StoreError::Backend("offline".to_owned())) })
     }
     fn get<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<Registration>, StoreError>> {
@@ -583,14 +587,17 @@ async fn verifies_official_switch_webhook_vector_end_to_end() {
 
     // Bind the exact vector handle to the exact vector public key.
     app.store
-        .insert(&Registration {
-            handle: "iUsOsTv5mB7OMLMdQZi8QA".to_owned(),
-            platform: Platform::Apns,
-            device_token: apns_token('f'),
-            push_key: b64_decode_array::<32>(VECTOR_KEY).unwrap(),
-            apns_env: Some(ApnsEnv::Production),
-            created_at_ms: BASE_TIME_MS,
-        })
+        .insert(
+            &Registration {
+                handle: "iUsOsTv5mB7OMLMdQZi8QA".to_owned(),
+                platform: Platform::Apns,
+                device_token: apns_token('f'),
+                push_key: b64_decode_array::<32>(VECTOR_KEY).unwrap(),
+                apns_env: Some(ApnsEnv::Production),
+                created_at_ms: BASE_TIME_MS,
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -660,4 +667,75 @@ async fn upstream_error_returns_502_and_invalid_token_prunes_handle() {
         .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert_eq!(app.sender.recorded().len(), before);
+}
+
+#[tokio::test]
+async fn register_enforces_global_rate_limit_with_retry_after() {
+    let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    settings.register_rate_limit_per_minute = 2;
+    let app = TestApp::new(settings).await;
+    let key = key_from_seed(61);
+
+    let (s1, _) = app.register("fcm", "token_1", &key, None).await;
+    assert_eq!(s1, StatusCode::OK);
+    let (s2, _) = app.register("fcm", "token_2", &key, None).await;
+    assert_eq!(s2, StatusCode::OK);
+
+    // Third registration within the same 60-second window returns 429 with Retry-After.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "platform": "fcm",
+                "device_token": "token_3",
+                "push_key": b64_encode(&key.verifying_key().to_bytes()),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (s3, headers, body) = app.send(req).await;
+    assert_eq!(s3, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "rate_limited");
+    assert!(body["retry_after"].as_u64().unwrap() >= 1);
+    assert!(headers.get("retry-after").is_some());
+
+    // After 60 seconds, registration is accepted again.
+    app.clock.advance_ms(60_000);
+    let (s4, _) = app.register("fcm", "token_3", &key, None).await;
+    assert_eq!(s4, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn register_enforces_max_registrations_cap_and_recovers_after_prune() {
+    let mut settings = RelaySettings::new(TEST_ORIGIN).unwrap();
+    settings.max_registrations = 2;
+    let app = TestApp::new(settings).await;
+    let key = key_from_seed(62);
+
+    let (s1, b1) = app.register("fcm", "cap_token_1", &key, None).await;
+    assert_eq!(s1, StatusCode::OK);
+    let handle1 = b1["handle"].as_str().unwrap().to_owned();
+
+    let (s2, _) = app.register("fcm", "cap_token_2", &key, None).await;
+    assert_eq!(s2, StatusCode::OK);
+
+    // Store is now full: third registration returns 503 unavailable.
+    let (s3, b3) = app.register("fcm", "cap_token_3", &key, None).await;
+    assert_eq!(s3, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(b3["code"], "unavailable");
+
+    // Pruning handle1 via invalid-token feedback frees a slot for new registrations.
+    app.sender.enqueue_outcome(PushOutcome::InvalidToken {
+        reason: "UNREGISTERED".to_owned(),
+    });
+    let (sh, _, bh) = app
+        .post_signed_hook(&key, &handle1, BASE_TIME_MS, [90; 16])
+        .await;
+    assert_eq!(sh, StatusCode::OK);
+    assert_eq!(bh["pruned"], true);
+
+    let (s4, _) = app.register("fcm", "cap_token_3", &key, None).await;
+    assert_eq!(s4, StatusCode::OK);
 }

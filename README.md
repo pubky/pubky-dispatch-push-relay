@@ -49,7 +49,7 @@ Content-Type: application/json
 }
 ```
 
-Errors: `400 bad_request` (invalid JSON, unknown fields, invalid token, invalid/small-order key), `413 too_large`.
+Errors: `400 bad_request` (invalid JSON, unknown fields, invalid token, invalid/small-order key), `413 too_large`, `429 rate_limited` (global registration limit exceeded, with `Retry-After`), `503 unavailable` (registration store capacity cap reached).
 
 ---
 
@@ -128,7 +128,7 @@ Each device obtains its native push token and sends it together with that `push_
 - **Android (FCM):**
   - Obtain the registration token via `FirebaseMessaging.getInstance().token`.
   - Set `"platform": "fcm"` and omit `apns_env`.
-  - The relay sends a high-priority **data-only** FCM HTTP v1 message (`{"data":{"type":"wake","v":"1"},"android":{"priority":"HIGH"}}`) with no `notification` block, ensuring `FirebaseMessagingService.onMessageReceived` runs even when the app is backgrounded or in Doze mode. Trigger a background feed sync when `remoteMessage.data["type"] == "wake"`.
+  - The relay sends a high-priority **data-only** FCM HTTP v1 message (`{"data":{"type":"wake","v":"1"},"android":{"collapse_key":"pubky-dispatch-wake","priority":"HIGH"}}`) with no `notification` block, ensuring `FirebaseMessagingService.onMessageReceived` runs even when the app is backgrounded or in Doze mode and coalescing bursts while offline. Trigger a background feed sync when `remoteMessage.data["type"] == "wake"`.
 
 ### 3. Commit handles to Pubky Dispatch
 
@@ -151,6 +151,8 @@ All options can be passed via environment variables or CLI flags (`--help` print
 | `RELAY_BIND_ADDR` | `0.0.0.0:8080` | TCP socket address to bind the HTTP listener. |
 | `DATABASE_URL` | `./data/push-relay.sqlite` | SQLite file path, `sqlite://...` URL, or `:memory:`. Parent directories are created automatically. |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Maximum wake pushes per handle per rolling 60-second window. |
+| `REGISTER_RATE_LIMIT_PER_MINUTE` | `120` | Global maximum `POST /v1/register` requests per rolling 60-second window (`429` with `Retry-After` when exceeded). |
+| `MAX_REGISTRATIONS` | `1000000` | Maximum total registrations stored before rejecting new registrations with `503`. |
 | `NONCE_CACHE_MAX_ENTRIES` | `100000` | Maximum entries retained in the 10-minute nonce replay cache. |
 | `PUSH_BACKEND` | `providers` | `providers` (APNs/FCM) or `noop` (for local development without Apple/Google credentials). |
 | `LOG_FORMAT` | `json` | `json` or `pretty`. Filter level controlled via `RUST_LOG`. |
@@ -193,6 +195,15 @@ docker run --rm -p 8080:8080 \
   -e FCM_SERVICE_ACCOUNT_JSON="$FCM_SA_BASE64" \
   pubky-dispatch-push-relay
 ```
+
+---
+
+## Production Deployment
+
+Because `POST /v1/register` is intentionally unauthenticated (clients submit only a device token and an opaque `push_key` with no user account), combine application-level and edge protections in production:
+
+- **Application limits:** Tune `REGISTER_RATE_LIMIT_PER_MINUTE` (default `120`) and `MAX_REGISTRATIONS` (default `1000000`) to bound write throughput and disk usage.
+- **Ingress per-IP rate limiting:** Apply per-IP rate limiting to `POST /v1/register` at your reverse proxy or CDN edge (for example, nginx `limit_req_zone` / `limit_req` or Cloudflare Rate Limiting Rules) while disabling IP access-log retention on `/v1/hook` to preserve relay privacy.
 
 ---
 

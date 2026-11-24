@@ -145,12 +145,18 @@ impl ApiError {
         }
     }
 
-    /// Creates a `429 rate_limited` error with a `Retry-After` hint.
+    /// Creates a `429 rate_limited` error with a `Retry-After` hint for `/v1/hook`.
     #[must_use]
     pub fn rate_limited(retry_after_secs: u64) -> Self {
+        Self::rate_limited_with_message(retry_after_secs, "handle exceeded per-minute push limit")
+    }
+
+    /// Creates a `429 rate_limited` error with a custom message and `Retry-After` hint.
+    #[must_use]
+    pub fn rate_limited_with_message(retry_after_secs: u64, message: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::RateLimited,
-            message: "handle exceeded per-minute push limit".to_owned(),
+            message: message.into(),
             retry_after: Some(retry_after_secs),
         }
     }
