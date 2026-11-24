@@ -4,11 +4,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey as _;
+use base64::Engine as _;
 use parking_lot::Mutex;
 use reqwest::Client;
+use ring::rand::SystemRandom;
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -138,7 +138,8 @@ struct ApnsErrorBody {
 /// APNs HTTP/2 wake push provider.
 pub struct ApnsSender {
     client: Client,
-    signing_key: SigningKey,
+    key_pair: EcdsaKeyPair,
+    rng: SystemRandom,
     team_id: String,
     key_id: String,
     bundle_id: String,
@@ -190,11 +191,13 @@ impl ApnsSender {
             ));
         }
 
-        let signing_key = SigningKey::from_pkcs8_pem(config.private_key_pem.as_str())
-            .map_err(|_| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()))?;
+        let rng = SystemRandom::new();
+        let key_pair = parse_p256_pkcs8_pem(config.private_key_pem.as_str(), &rng)?;
 
         // Exercise signing at startup so key issues fail immediately rather than on first push.
-        let _: Signature = signing_key.sign(b"apns-startup-check");
+        key_pair.sign(&rng, b"apns-startup-check").map_err(|_| {
+            PushError::Config("APNs P-256 key failed ES256 startup check".to_owned())
+        })?;
 
         let client = Client::builder()
             .timeout(config.timeout)
@@ -204,7 +207,8 @@ impl ApnsSender {
 
         Ok(Self {
             client,
-            signing_key,
+            key_pair,
+            rng,
             team_id: config.team_id,
             key_id: config.key_id,
             bundle_id: config.bundle_id,
@@ -257,11 +261,15 @@ impl ApnsSender {
         })?;
 
         let signing_input = format!("{}.{}", b64_encode(&header_json), b64_encode(&claims_json));
-        let signature: Signature = self.signing_key.sign(signing_input.as_bytes());
-        let sig_bytes = signature.to_bytes();
+        let signature = self
+            .key_pair
+            .sign(&self.rng, signing_input.as_bytes())
+            .map_err(|_| PushError::Auth {
+                class: UpstreamErrorClass::Auth,
+            })?;
         Ok(Zeroizing::new(format!(
             "{signing_input}.{}",
-            b64_encode(sig_bytes.as_ref())
+            b64_encode(signature.as_ref())
         )))
     }
 
@@ -343,6 +351,89 @@ impl ApnsSender {
 enum ApnsResponse {
     Outcome(PushOutcome),
     ExpiredToken,
+}
+
+/// Parses a PKCS#8 (`PRIVATE KEY`) PEM P-256 private key (Apple `.p8` format) into a
+/// [`ring::signature::EcdsaKeyPair`], zeroizing intermediate DER bytes on drop.
+fn parse_p256_pkcs8_pem(pem: &str, rng: &SystemRandom) -> Result<EcdsaKeyPair, PushError> {
+    const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
+    const END: &str = "-----END PRIVATE KEY-----";
+
+    let trimmed = pem.trim();
+    let (_, after_begin) = trimmed.split_once(BEGIN).ok_or_else(|| {
+        PushError::Config("APNs .p8 key must be PKCS#8 PRIVATE KEY PEM".to_owned())
+    })?;
+    let (body, _) = after_begin
+        .split_once(END)
+        .ok_or_else(|| PushError::Config("missing PEM END marker in APNs .p8 key".to_owned()))?;
+
+    let compact = Zeroizing::new(
+        body.chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect::<String>(),
+    );
+    let der = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .map_err(|_| PushError::Config("invalid base64 in APNs .p8 PEM key".to_owned()))?,
+    );
+
+    if let Ok(kp) = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &der, rng) {
+        return Ok(kp);
+    }
+
+    // Apple Developer Portal `.p8` files often include a redundant `[0] namedCurve` tag
+    // inside the inner SEC1 ECPrivateKey (`MIGTAgEA...`), which `ring::from_pkcs8` rejects.
+    // Extract the 32-byte private scalar and 65-byte uncompressed public key from that layout.
+    if let Some((priv_key, pub_key)) = parse_apple_p8_pkcs8_with_named_curve(&der) {
+        return EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            priv_key,
+            pub_key,
+            rng,
+        )
+        .map_err(|_| PushError::Config("invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned()));
+    }
+
+    Err(PushError::Config(
+        "invalid APNs .p8 PKCS#8 PEM P-256 key".to_owned(),
+    ))
+}
+
+/// Parses Apple's 138-byte PKCS#8 P-256 DER (`MIGTAgEA...`) carrying both `[0] namedCurve`
+/// and `[1] publicKey` inside the inner SEC1 `ECPrivateKey`.
+fn parse_apple_p8_pkcs8_with_named_curve(der: &[u8]) -> Option<(&[u8], &[u8])> {
+    // Prefix: SEQUENCE (147) { INTEGER 0, AlgorithmIdentifier(ecPublicKey, prime256v1),
+    // OCTET STRING (121) { SEQUENCE (119) { INTEGER 1, OCTET STRING (32) ... } } }
+    const PREFIX: &[u8] = &[
+        0x30, 0x81, 0x93, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+        0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x79, 0x30,
+        0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
+    ];
+    // Middle: [0] prime256v1 OID + [1] BIT STRING (65-byte uncompressed point)
+    const MIDDLE: &[u8] = &[
+        0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0xa1, 0x44, 0x03,
+        0x42, 0x00,
+    ];
+    let expected_len = PREFIX.len() + 32 + MIDDLE.len() + 65;
+    if der.len() != expected_len {
+        return None;
+    }
+    if !der.starts_with(PREFIX) {
+        return None;
+    }
+    let priv_start = PREFIX.len();
+    let mid_start = priv_start + 32;
+    let pub_start = mid_start + MIDDLE.len();
+    if der.get(mid_start..pub_start) != Some(MIDDLE) {
+        return None;
+    }
+    let priv_key = der.get(priv_start..mid_start)?;
+    let pub_key = der.get(pub_start..)?;
+    if pub_key.first() != Some(&0x04) {
+        return None;
+    }
+    Some((priv_key, pub_key))
 }
 
 /// Requires explicit token-specific APNs evidence before deleting a handle:
@@ -435,5 +526,50 @@ mod tests {
                 "expected non-pruning for ({status}, {reason:?})"
             );
         }
+    }
+
+    #[test]
+    fn parses_both_openssl_and_apple_p8_pkcs8_layouts() {
+        let rng = SystemRandom::new();
+        // OpenSSL 3 PKCS#8 P-256 layout (`MIGHAgEA...`, without inner `[0] namedCurve`).
+        let openssl_pem = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqqAO++8h+XsXLStn
+Gp0X0DGtKQytjLTKJkmEHtPgH82hRANCAATDU5zOZ/4OQlLrWs54n25PpWLNjV8R
+JuPZpk8VOSsbnrqvn8wbb67SMGiIvO0fc+LfUdrStgDJKPZM4+epIvG/
+-----END PRIVATE KEY-----";
+        let kp1 = parse_p256_pkcs8_pem(openssl_pem, &rng).unwrap();
+
+        // Apple Developer Portal `.p8` PKCS#8 layout (`MIGTAgEA...`, with inner `[0] namedCurve`).
+        let openssl_der = base64::engine::general_purpose::STANDARD
+            .decode(
+                openssl_pem
+                    .lines()
+                    .filter(|l| !l.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        let priv_key = &openssl_der[36..68];
+        let pub_key = &openssl_der[73..138];
+        let mut apple_der = Vec::new();
+        apple_der.extend_from_slice(&[
+            0x30, 0x81, 0x93, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+            0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04,
+            0x79, 0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
+        ]);
+        apple_der.extend_from_slice(priv_key);
+        apple_der.extend_from_slice(&[
+            0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0xa1, 0x44,
+            0x03, 0x42, 0x00,
+        ]);
+        apple_der.extend_from_slice(pub_key);
+        let apple_b64 = base64::engine::general_purpose::STANDARD.encode(&apple_der);
+        assert!(apple_b64.starts_with("MIGTAgEA"));
+        let apple_pem =
+            format!("-----BEGIN PRIVATE KEY-----\n{apple_b64}\n-----END PRIVATE KEY-----");
+        let kp2 = parse_p256_pkcs8_pem(&apple_pem, &rng).unwrap();
+
+        use ring::signature::KeyPair as _;
+        assert_eq!(kp1.public_key().as_ref(), kp2.public_key().as_ref());
     }
 }

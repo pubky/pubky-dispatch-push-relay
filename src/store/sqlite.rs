@@ -1,13 +1,13 @@
 //! SQLite implementations of [`RegistrationStore`] and durable [`ReplayStore`].
 
+use std::fmt;
 use std::path::Path;
-use std::str::FromStr;
+use std::str::FromStr as _;
+use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::Row as _;
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
-};
+use parking_lot::Mutex;
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
 use super::{
     ApnsEnv, BoxFuture, Platform, RegisterOutcome, Registration, RegistrationLimits,
@@ -51,10 +51,39 @@ CREATE INDEX IF NOT EXISTS idx_webhook_nonces_expires_at
     ON webhook_nonces (expires_at_ms);
 ";
 
+/// Shared thread-safe SQLite connection handle used by [`SqliteStore`] and [`SqliteReplayStore`].
+#[derive(Clone)]
+pub struct SqliteHandle {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl fmt::Debug for SqliteHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqliteHandle").finish_non_exhaustive()
+    }
+}
+
+impl SqliteHandle {
+    async fn run<T, E, F>(&self, op: F) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static + From<String>,
+        F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
+    {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock();
+            op(&mut guard)
+        })
+        .await
+        .map_err(|e| E::from(format!("sqlite task join error: {e}")))?
+    }
+}
+
 /// SQLite-backed [`RegistrationStore`].
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
-    pool: SqlitePool,
+    handle: SqliteHandle,
 }
 
 impl SqliteStore {
@@ -67,50 +96,25 @@ impl SqliteStore {
     ///
     /// Returns [`StoreError::Backend`] if the database cannot be opened or initialized.
     pub async fn open(path_or_url: &str) -> Result<Self, StoreError> {
-        let is_memory = path_or_url == ":memory:" || path_or_url == "sqlite::memory:";
+        let target = path_or_url.to_owned();
+        let conn = tokio::task::spawn_blocking(move || open_connection(&target))
+            .await
+            .map_err(|e| StoreError::Backend(format!("sqlite open task failed: {e}")))??;
 
-        let options = if is_memory {
-            SqliteConnectOptions::from_str("sqlite::memory:")
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .busy_timeout(Duration::from_secs(5))
-        } else {
-            let file_path = path_or_url
-                .strip_prefix("sqlite://")
-                .or_else(|| path_or_url.strip_prefix("sqlite:"))
-                .unwrap_or(path_or_url);
-            if let Some(parent) = Path::new(file_path).parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| StoreError::Backend(format!("failed to create db dir: {e}")))?;
-            }
-            SqliteConnectOptions::new()
-                .filename(file_path)
-                .create_if_missing(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .busy_timeout(Duration::from_secs(5))
+        let handle = SqliteHandle {
+            conn: Arc::new(Mutex::new(conn)),
         };
 
-        let max_connections = if is_memory { 1 } else { 8 };
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .connect_with(options)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        handle
+            .run(|conn| {
+                conn.execute_batch(&format!(
+                    "{REGISTRATIONS_TABLE_SQL}\n{REGISTRATIONS_INDEX_KEY_SQL}\n{REGISTRATIONS_INDEX_ACTIVE_SQL}"
+                ))
+                .map_err(|e| StoreError::Backend(format!("failed to initialize schema: {e}")))
+            })
+            .await?;
 
-        for stmt in [
-            REGISTRATIONS_TABLE_SQL,
-            REGISTRATIONS_INDEX_KEY_SQL,
-            REGISTRATIONS_INDEX_ACTIVE_SQL,
-        ] {
-            sqlx::query(stmt)
-                .execute(&pool)
-                .await
-                .map_err(|e| StoreError::Backend(format!("failed to initialize schema: {e}")))?;
-        }
-
-        Ok(Self { pool })
+        Ok(Self { handle })
     }
 
     /// Creates an ephemeral in-memory SQLite store for tests and local experiments.
@@ -122,42 +126,73 @@ impl SqliteStore {
         Self::open(":memory:").await
     }
 
-    /// Returns a reference to the underlying [`SqlitePool`] so [`SqliteReplayStore`] can
+    /// Returns a reference to the shared [`SqliteHandle`] so [`SqliteReplayStore`] can
     /// persist nonces in the same SQLite database file.
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    pub fn pool(&self) -> &SqliteHandle {
+        &self.handle
     }
 }
 
-fn decode_row(row: &sqlx::sqlite::SqliteRow) -> Result<Registration, StoreError> {
+fn open_connection(path_or_url: &str) -> Result<Connection, StoreError> {
+    let is_memory = path_or_url == ":memory:" || path_or_url == "sqlite::memory:";
+
+    let conn = if is_memory {
+        Connection::open_in_memory().map_err(|e| StoreError::Backend(e.to_string()))?
+    } else {
+        let stripped = path_or_url
+            .strip_prefix("sqlite://")
+            .or_else(|| path_or_url.strip_prefix("sqlite:"))
+            .unwrap_or(path_or_url);
+        let file_path = stripped.split('?').next().unwrap_or(stripped);
+        if let Some(parent) = Path::new(file_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StoreError::Backend(format!("failed to create db dir: {e}")))?;
+        }
+        Connection::open(file_path).map_err(|e| StoreError::Backend(e.to_string()))?
+    };
+
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+    if !is_memory {
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+    }
+
+    Ok(conn)
+}
+
+fn decode_row(row: &rusqlite::Row<'_>) -> Result<Registration, StoreError> {
     let handle: String = row
-        .try_get("handle")
+        .get(0)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let platform_str: String = row
-        .try_get("platform")
+        .get(1)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let platform = Platform::from_str(&platform_str)?;
     let device_token: String = row
-        .try_get("device_token")
+        .get(2)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let key_vec: Vec<u8> = row
-        .try_get("push_key")
+        .get(3)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let push_key: [u8; 32] = key_vec
         .try_into()
         .map_err(|_| StoreError::CorruptData("push_key is not 32 bytes".to_owned()))?;
     let apns_env_str: Option<String> = row
-        .try_get("apns_env")
+        .get(4)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let apns_env = apns_env_str.as_deref().map(ApnsEnv::from_str).transpose()?;
     let created_i64: i64 = row
-        .try_get("created_at_ms")
+        .get(5)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let created_at_ms = u64::try_from(created_i64)
         .map_err(|_| StoreError::CorruptData("negative created_at_ms".to_owned()))?;
     let last_active_i64: i64 = row
-        .try_get("last_active_at_ms")
+        .get(6)
         .map_err(|e| StoreError::CorruptData(e.to_string()))?;
     let last_active_at_ms = u64::try_from(last_active_i64)
         .map_err(|_| StoreError::CorruptData("negative last_active_at_ms".to_owned()))?;
@@ -173,6 +208,26 @@ fn decode_row(row: &sqlx::sqlite::SqliteRow) -> Result<Registration, StoreError>
     })
 }
 
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.extended_code == 1555 || inner.extended_code == 2067
+    )
+}
+
+impl From<String> for StoreError {
+    fn from(msg: String) -> Self {
+        Self::Backend(msg)
+    }
+}
+
+impl From<String> for ReplayError {
+    fn from(msg: String) -> Self {
+        Self::Backend(msg)
+    }
+}
+
 impl RegistrationStore for SqliteStore {
     fn register_or_get<'a>(
         &'a self,
@@ -180,118 +235,108 @@ impl RegistrationStore for SqliteStore {
         limits: RegistrationLimits,
         now_ms: u64,
     ) -> BoxFuture<'a, Result<RegisterOutcome, StoreError>> {
+        let candidate = candidate.clone();
         Box::pin(async move {
             let now_i64 = i64::try_from(now_ms)
                 .map_err(|_| StoreError::CorruptData("now_ms overflows i64".to_owned()))?;
             let cutoff_i64 = i64::try_from(now_ms.saturating_sub(limits.ttl_ms)).unwrap_or(0);
-            let apns_env = candidate.apns_env.map(ApnsEnv::as_str);
 
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            // 1. Idempotent re-registration: return existing active handle for the same
-            //    (platform, device_token, push_key, apns_env).
-            let existing: Option<String> = sqlx::query_scalar(
-                "SELECT handle FROM registrations \
-                 WHERE platform = ?1 AND device_token = ?2 AND push_key = ?3 \
-                   AND apns_env IS ?4 AND last_active_at_ms > ?5 \
-                 LIMIT 1",
-            )
-            .bind(candidate.platform.as_str())
-            .bind(&candidate.device_token)
-            .bind(candidate.push_key.as_slice())
-            .bind(apns_env)
-            .bind(cutoff_i64)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            if let Some(handle) = existing {
-                sqlx::query(
-                    "UPDATE registrations \
-                     SET last_active_at_ms = MAX(last_active_at_ms, ?1) \
-                     WHERE handle = ?2",
-                )
-                .bind(now_i64)
-                .bind(&handle)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
-                return Ok(RegisterOutcome::Existing(handle));
-            }
-
-            // 2. Reclaim expired registrations so stale entries never block active ones.
-            sqlx::query("DELETE FROM registrations WHERE last_active_at_ms <= ?1")
-                .bind(cutoff_i64)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            // 3. Enforce per-push-key active handle cap (never evicts existing handles).
-            let key_count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM registrations WHERE push_key = ?1")
-                    .bind(candidate.push_key.as_slice())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
-            if u64::try_from(key_count).unwrap_or(u64::MAX)
-                >= u64::from(limits.max_handles_per_push_key)
-            {
-                let _ = tx.rollback().await;
-                return Err(StoreError::PushKeyCapacityExceeded);
-            }
-
-            // 4. Enforce global registration capacity cap.
-            let total_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM registrations")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            if u64::try_from(total_count).unwrap_or(u64::MAX) >= limits.max_registrations {
-                let _ = tx.rollback().await;
-                return Err(StoreError::CapacityExceeded);
-            }
-
-            // 5. Insert fresh handle.
-            let res = sqlx::query(
-                "INSERT INTO registrations \
-                 (handle, platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .bind(&candidate.handle)
-            .bind(candidate.platform.as_str())
-            .bind(&candidate.device_token)
-            .bind(candidate.push_key.as_slice())
-            .bind(apns_env)
-            .bind(now_i64)
-            .bind(now_i64)
-            .execute(&mut *tx)
-            .await;
-
-            match res {
-                Ok(_) => {
-                    tx.commit()
-                        .await
+            self.handle
+                .run(move |conn| {
+                    let apns_env = candidate.apns_env.map(ApnsEnv::as_str);
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
                         .map_err(|e| StoreError::Backend(e.to_string()))?;
-                    Ok(RegisterOutcome::Created(candidate.handle.clone()))
-                }
-                Err(sqlx::Error::Database(db_err))
-                    if db_err.is_unique_violation()
-                        || matches!(db_err.code().as_deref(), Some("1555" | "2067")) =>
-                {
-                    let _ = tx.rollback().await;
-                    Err(StoreError::DuplicateHandle)
-                }
-                Err(err) => {
-                    let _ = tx.rollback().await;
-                    Err(StoreError::Backend(err.to_string()))
-                }
-            }
+
+                    // 1. Idempotent re-registration: return existing active handle for the same
+                    //    (platform, device_token, push_key, apns_env).
+                    let existing: Option<String> = tx
+                        .query_row(
+                            "SELECT handle FROM registrations \
+                             WHERE platform = ?1 AND device_token = ?2 AND push_key = ?3 \
+                               AND apns_env IS ?4 AND last_active_at_ms > ?5 \
+                             LIMIT 1",
+                            params![
+                                candidate.platform.as_str(),
+                                &candidate.device_token,
+                                candidate.push_key.as_slice(),
+                                apns_env,
+                                cutoff_i64
+                            ],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+                    if let Some(handle) = existing {
+                        tx.execute(
+                            "UPDATE registrations \
+                             SET last_active_at_ms = MAX(last_active_at_ms, ?1) \
+                             WHERE handle = ?2",
+                            params![now_i64, &handle],
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                        tx.commit()
+                            .map_err(|e| StoreError::Backend(e.to_string()))?;
+                        return Ok(RegisterOutcome::Existing(handle));
+                    }
+
+                    // 2. Reclaim expired registrations so stale entries never block active ones.
+                    tx.execute(
+                        "DELETE FROM registrations WHERE last_active_at_ms <= ?1",
+                        params![cutoff_i64],
+                    )
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+                    // 3. Enforce per-push-key active handle cap (never evicts existing handles).
+                    let key_count: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM registrations WHERE push_key = ?1",
+                            params![candidate.push_key.as_slice()],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    if u64::try_from(key_count).unwrap_or(u64::MAX)
+                        >= u64::from(limits.max_handles_per_push_key)
+                    {
+                        return Err(StoreError::PushKeyCapacityExceeded);
+                    }
+
+                    // 4. Enforce global registration capacity cap.
+                    let total_count: i64 = tx
+                        .query_row("SELECT COUNT(*) FROM registrations", [], |r| r.get(0))
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    if u64::try_from(total_count).unwrap_or(u64::MAX) >= limits.max_registrations {
+                        return Err(StoreError::CapacityExceeded);
+                    }
+
+                    // 5. Insert fresh handle.
+                    let res = tx.execute(
+                        "INSERT INTO registrations \
+                         (handle, platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            &candidate.handle,
+                            candidate.platform.as_str(),
+                            &candidate.device_token,
+                            candidate.push_key.as_slice(),
+                            apns_env,
+                            now_i64,
+                            now_i64
+                        ],
+                    );
+
+                    match res {
+                        Ok(_) => {
+                            tx.commit()
+                                .map_err(|e| StoreError::Backend(e.to_string()))?;
+                            Ok(RegisterOutcome::Created(candidate.handle))
+                        }
+                        Err(err) if is_unique_violation(&err) => Err(StoreError::DuplicateHandle),
+                        Err(err) => Err(StoreError::Backend(err.to_string())),
+                    }
+                })
+                .await
         })
     }
 
@@ -300,6 +345,7 @@ impl RegistrationStore for SqliteStore {
         registration: &'a Registration,
         max_registrations: Option<u64>,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let registration = registration.clone();
         Box::pin(async move {
             let created_at_ms = i64::try_from(registration.created_at_ms)
                 .map_err(|_| StoreError::CorruptData("created_at_ms overflows i64".to_owned()))?;
@@ -307,54 +353,53 @@ impl RegistrationStore for SqliteStore {
                 i64::try_from(registration.last_active_at_ms).map_err(|_| {
                     StoreError::CorruptData("last_active_at_ms overflows i64".to_owned())
                 })?;
-            let apns_env = registration.apns_env.map(ApnsEnv::as_str);
 
-            let result = if let Some(cap) = max_registrations {
-                let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
-                sqlx::query(
-                    "INSERT INTO registrations \
-                     (handle, platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms) \
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
-                     WHERE (SELECT COUNT(*) FROM registrations) < ?8",
-                )
-                .bind(&registration.handle)
-                .bind(registration.platform.as_str())
-                .bind(&registration.device_token)
-                .bind(registration.push_key.as_slice())
-                .bind(apns_env)
-                .bind(created_at_ms)
-                .bind(last_active_at_ms)
-                .bind(cap_i64)
-                .execute(&self.pool)
-                .await
-            } else {
-                sqlx::query(
-                    "INSERT INTO registrations \
-                     (handle, platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )
-                .bind(&registration.handle)
-                .bind(registration.platform.as_str())
-                .bind(&registration.device_token)
-                .bind(registration.push_key.as_slice())
-                .bind(apns_env)
-                .bind(created_at_ms)
-                .bind(last_active_at_ms)
-                .execute(&self.pool)
-                .await
-            };
+            self.handle
+                .run(move |conn| {
+                    let apns_env = registration.apns_env.map(ApnsEnv::as_str);
+                    let result = if let Some(cap) = max_registrations {
+                        let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
+                        conn.execute(
+                            "INSERT INTO registrations \
+                             (handle, platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms) \
+                             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
+                             WHERE (SELECT COUNT(*) FROM registrations) < ?8",
+                            params![
+                                &registration.handle,
+                                registration.platform.as_str(),
+                                &registration.device_token,
+                                registration.push_key.as_slice(),
+                                apns_env,
+                                created_at_ms,
+                                last_active_at_ms,
+                                cap_i64
+                            ],
+                        )
+                    } else {
+                        conn.execute(
+                            "INSERT INTO registrations \
+                             (handle, platform, device_token, push_key, apns_env, created_at_ms, last_active_at_ms) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![
+                                &registration.handle,
+                                registration.platform.as_str(),
+                                &registration.device_token,
+                                registration.push_key.as_slice(),
+                                apns_env,
+                                created_at_ms,
+                                last_active_at_ms
+                            ],
+                        )
+                    };
 
-            match result {
-                Ok(done) if done.rows_affected() == 0 => Err(StoreError::CapacityExceeded),
-                Ok(_) => Ok(()),
-                Err(sqlx::Error::Database(db_err))
-                    if db_err.is_unique_violation()
-                        || matches!(db_err.code().as_deref(), Some("1555" | "2067")) =>
-                {
-                    Err(StoreError::DuplicateHandle)
-                }
-                Err(err) => Err(StoreError::Backend(err.to_string())),
-            }
+                    match result {
+                        Ok(0) => Err(StoreError::CapacityExceeded),
+                        Ok(_) => Ok(()),
+                        Err(err) if is_unique_violation(&err) => Err(StoreError::DuplicateHandle),
+                        Err(err) => Err(StoreError::Backend(err.to_string())),
+                    }
+                })
+                .await
         })
     }
 
@@ -362,18 +407,29 @@ impl RegistrationStore for SqliteStore {
         &'a self,
         handle: &'a str,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>> {
+        let handle = handle.to_owned();
         Box::pin(async move {
-            let row = sqlx::query(
-                "SELECT handle, platform, device_token, push_key, apns_env, \
-                        created_at_ms, last_active_at_ms \
-                 FROM registrations WHERE handle = ?1",
-            )
-            .bind(handle)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            row.as_ref().map(decode_row).transpose()
+            self.handle
+                .run(move |conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT handle, platform, device_token, push_key, apns_env, \
+                                    created_at_ms, last_active_at_ms \
+                             FROM registrations WHERE handle = ?1",
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    let mut rows = stmt
+                        .query(params![&handle])
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    match rows
+                        .next()
+                        .map_err(|e| StoreError::Backend(e.to_string()))?
+                    {
+                        Some(row) => decode_row(row).map(Some),
+                        None => Ok(None),
+                    }
+                })
+                .await
         })
     }
 
@@ -382,20 +438,30 @@ impl RegistrationStore for SqliteStore {
         handle: &'a str,
         active_cutoff_ms: u64,
     ) -> BoxFuture<'a, Result<Option<Registration>, StoreError>> {
+        let handle = handle.to_owned();
+        let cutoff_i64 = i64::try_from(active_cutoff_ms).unwrap_or(i64::MAX);
         Box::pin(async move {
-            let cutoff_i64 = i64::try_from(active_cutoff_ms).unwrap_or(i64::MAX);
-            let row = sqlx::query(
-                "SELECT handle, platform, device_token, push_key, apns_env, \
-                        created_at_ms, last_active_at_ms \
-                 FROM registrations WHERE handle = ?1 AND last_active_at_ms > ?2",
-            )
-            .bind(handle)
-            .bind(cutoff_i64)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            row.as_ref().map(decode_row).transpose()
+            self.handle
+                .run(move |conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT handle, platform, device_token, push_key, apns_env, \
+                                    created_at_ms, last_active_at_ms \
+                             FROM registrations WHERE handle = ?1 AND last_active_at_ms > ?2",
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    let mut rows = stmt
+                        .query(params![&handle, cutoff_i64])
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    match rows
+                        .next()
+                        .map_err(|e| StoreError::Backend(e.to_string()))?
+                    {
+                        Some(row) => decode_row(row).map(Some),
+                        None => Ok(None),
+                    }
+                })
+                .await
         })
     }
 
@@ -404,79 +470,98 @@ impl RegistrationStore for SqliteStore {
         handle: &'a str,
         now_ms: u64,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let handle = handle.to_owned();
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
         Box::pin(async move {
-            let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
-            sqlx::query(
-                "UPDATE registrations \
-                 SET last_active_at_ms = MAX(last_active_at_ms, ?1) \
-                 WHERE handle = ?2",
-            )
-            .bind(now_i64)
-            .bind(handle)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(())
+            self.handle
+                .run(move |conn| {
+                    conn.execute(
+                        "UPDATE registrations \
+                         SET last_active_at_ms = MAX(last_active_at_ms, ?1) \
+                         WHERE handle = ?2",
+                        params![now_i64, &handle],
+                    )
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    Ok(())
+                })
+                .await
+        })
+    }
+
+    fn prune_expired<'a>(
+        &'a self,
+        active_cutoff_ms: u64,
+    ) -> BoxFuture<'a, Result<usize, StoreError>> {
+        let cutoff_i64 = i64::try_from(active_cutoff_ms).unwrap_or(i64::MAX);
+        Box::pin(async move {
+            self.handle
+                .run(move |conn| {
+                    let deleted = conn
+                        .execute(
+                            "DELETE FROM registrations WHERE last_active_at_ms <= ?1",
+                            params![cutoff_i64],
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    Ok(deleted)
+                })
+                .await
         })
     }
 
     fn delete<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let handle = handle.to_owned();
         Box::pin(async move {
-            let res = sqlx::query("DELETE FROM registrations WHERE handle = ?1")
-                .bind(handle)
-                .execute(&self.pool)
+            self.handle
+                .run(move |conn| {
+                    let deleted = conn
+                        .execute(
+                            "DELETE FROM registrations WHERE handle = ?1",
+                            params![&handle],
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    Ok(deleted > 0)
+                })
                 .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(res.rows_affected() > 0)
         })
     }
 
-    fn prune_expired<'a>(&'a self, cutoff_ms: u64) -> BoxFuture<'a, Result<usize, StoreError>> {
+    fn ping(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
-            let cutoff_i64 = i64::try_from(cutoff_ms).unwrap_or(i64::MAX);
-            let res = sqlx::query("DELETE FROM registrations WHERE last_active_at_ms <= ?1")
-                .bind(cutoff_i64)
-                .execute(&self.pool)
+            self.handle
+                .run(|conn| {
+                    let _: i64 = conn
+                        .query_row("SELECT 1", [], |r| r.get(0))
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    Ok(())
+                })
                 .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(usize::try_from(res.rows_affected()).unwrap_or(usize::MAX))
-        })
-    }
-
-    fn ping<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            sqlx::query("SELECT 1")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(())
         })
     }
 }
 
-/// Durable SQLite-backed [`ReplayStore`].
+/// Durable SQLite-backed [`ReplayStore`] for single-instance deployments.
 ///
-/// Persists webhook nonces to disk so restarts preserve the 10-minute replay window,
+/// Persists nonces in the `webhook_nonces` table so replay protection survives restarts,
 /// enforces a hard live-entry cap without ever evicting live nonces (`503` when full),
 /// and guards in-process entries with monotonic time so forward-and-back wall-clock jumps
 /// cannot reopen a replay.
 #[derive(Clone, Debug)]
 pub struct SqliteReplayStore {
-    pool: SqlitePool,
+    handle: SqliteHandle,
     ttl_ms: u64,
     max_entries: usize,
     boot_id: [u8; 16],
 }
 
 impl SqliteReplayStore {
-    /// Initializes the durable `webhook_nonces` table on `pool` using the standard
+    /// Initializes the durable `webhook_nonces` table on `handle` using the standard
     /// 10-minute [`NONCE_TTL_MS`] window and `max_entries` cap.
     ///
     /// # Errors
     ///
     /// Returns [`ReplayError::Backend`] if schema initialization or RNG fails.
-    pub async fn new(pool: SqlitePool, max_entries: usize) -> Result<Self, ReplayError> {
-        Self::with_ttl(pool, NONCE_TTL_MS, max_entries).await
+    pub async fn new(handle: SqliteHandle, max_entries: usize) -> Result<Self, ReplayError> {
+        Self::with_ttl(handle, NONCE_TTL_MS, max_entries).await
     }
 
     /// Initializes the durable `webhook_nonces` table with a custom TTL and cap.
@@ -485,7 +570,7 @@ impl SqliteReplayStore {
     ///
     /// Returns [`ReplayError::Backend`] if schema initialization or RNG fails.
     pub async fn with_ttl(
-        pool: SqlitePool,
+        handle: SqliteHandle,
         ttl_ms: u64,
         max_entries: usize,
     ) -> Result<Self, ReplayError> {
@@ -493,15 +578,17 @@ impl SqliteReplayStore {
         getrandom::fill(&mut boot_id)
             .map_err(|_| ReplayError::Backend("failed to generate boot_id".to_owned()))?;
 
-        for stmt in [NONCES_TABLE_SQL, NONCES_INDEX_SQL] {
-            sqlx::query(stmt)
-                .execute(&pool)
-                .await
-                .map_err(|e| ReplayError::Backend(format!("failed to init webhook_nonces: {e}")))?;
-        }
+        handle
+            .run(|conn| {
+                conn.execute_batch(&format!("{NONCES_TABLE_SQL}\n{NONCES_INDEX_SQL}"))
+                    .map_err(|e| {
+                        ReplayError::Backend(format!("failed to init webhook_nonces: {e}"))
+                    })
+            })
+            .await?;
 
         Ok(Self {
-            pool,
+            handle,
             ttl_ms,
             max_entries: max_entries.max(1),
             boot_id,
@@ -516,78 +603,70 @@ impl ReplayStore for SqliteReplayStore {
         wall_now_ms: u64,
         mono_now_ms: u64,
     ) -> BoxFuture<'a, Result<bool, ReplayError>> {
+        let ttl_ms = self.ttl_ms;
+        let max_entries = self.max_entries;
+        let boot_id = self.boot_id;
         Box::pin(async move {
             let wall_i64 = i64::try_from(wall_now_ms)
                 .map_err(|_| ReplayError::Backend("wall_now_ms overflows i64".to_owned()))?;
             let mono_i64 = i64::try_from(mono_now_ms)
                 .map_err(|_| ReplayError::Backend("mono_now_ms overflows i64".to_owned()))?;
-            let wall_exp =
-                i64::try_from(wall_now_ms.saturating_add(self.ttl_ms)).unwrap_or(i64::MAX);
-            let mono_exp =
-                i64::try_from(mono_now_ms.saturating_add(self.ttl_ms)).unwrap_or(i64::MAX);
+            let wall_exp = i64::try_from(wall_now_ms.saturating_add(ttl_ms)).unwrap_or(i64::MAX);
+            let mono_exp = i64::try_from(mono_now_ms.saturating_add(ttl_ms)).unwrap_or(i64::MAX);
 
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| ReplayError::Backend(e.to_string()))?;
+            self.handle
+                .run(move |conn| {
+                    let tx = conn
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
 
-            // Prune entries that are conservatively expired.
-            sqlx::query(
-                "DELETE FROM webhook_nonces \
-                 WHERE (boot_id != ?1 AND expires_at_ms <= ?2) \
-                    OR (boot_id = ?1 AND expires_at_ms <= ?2 AND mono_expires_ms <= ?3)",
-            )
-            .bind(self.boot_id.as_slice())
-            .bind(wall_i64)
-            .bind(mono_i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ReplayError::Backend(e.to_string()))?;
-
-            // If still present after conservative pruning, the nonce is live -> replay (409).
-            let exists: Option<i64> =
-                sqlx::query_scalar("SELECT 1 FROM webhook_nonces WHERE nonce = ?1")
-                    .bind(nonce.as_slice())
-                    .fetch_optional(&mut *tx)
-                    .await
+                    // Prune entries that are conservatively expired.
+                    tx.execute(
+                        "DELETE FROM webhook_nonces \
+                         WHERE (boot_id != ?1 AND expires_at_ms <= ?2) \
+                            OR (boot_id = ?1 AND expires_at_ms <= ?2 AND mono_expires_ms <= ?3)",
+                        params![boot_id.as_slice(), wall_i64, mono_i64],
+                    )
                     .map_err(|e| ReplayError::Backend(e.to_string()))?;
 
-            if exists.is_some() {
-                tx.commit()
-                    .await
+                    // If still present after conservative pruning, the nonce is live -> replay (409).
+                    let exists: Option<i64> = tx
+                        .query_row(
+                            "SELECT 1 FROM webhook_nonces WHERE nonce = ?1",
+                            params![nonce.as_slice()],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
+
+                    if exists.is_some() {
+                        tx.commit()
+                            .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                        return Ok(false);
+                    }
+
+                    // Never evict live nonces when full; refuse new webhooks with 503.
+                    let live_count: i64 = tx
+                        .query_row("SELECT COUNT(*) FROM webhook_nonces", [], |r| r.get(0))
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                    if usize::try_from(live_count).unwrap_or(usize::MAX) >= max_entries {
+                        tx.commit()
+                            .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                        return Err(ReplayError::CapacityExceeded);
+                    }
+
+                    tx.execute(
+                        "INSERT INTO webhook_nonces (nonce, expires_at_ms, boot_id, mono_expires_ms) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![nonce.as_slice(), wall_exp, boot_id.as_slice(), mono_exp],
+                    )
                     .map_err(|e| ReplayError::Backend(e.to_string()))?;
-                return Ok(false);
-            }
 
-            // Never evict live nonces when full; refuse new webhooks with 503.
-            let live_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_nonces")
-                .fetch_one(&mut *tx)
+                    tx.commit()
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                    Ok(true)
+                })
                 .await
-                .map_err(|e| ReplayError::Backend(e.to_string()))?;
-            if usize::try_from(live_count).unwrap_or(usize::MAX) >= self.max_entries {
-                tx.commit()
-                    .await
-                    .map_err(|e| ReplayError::Backend(e.to_string()))?;
-                return Err(ReplayError::CapacityExceeded);
-            }
-
-            sqlx::query(
-                "INSERT INTO webhook_nonces (nonce, expires_at_ms, boot_id, mono_expires_ms) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .bind(nonce.as_slice())
-            .bind(wall_exp)
-            .bind(self.boot_id.as_slice())
-            .bind(mono_exp)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ReplayError::Backend(e.to_string()))?;
-
-            tx.commit()
-                .await
-                .map_err(|e| ReplayError::Backend(e.to_string()))?;
-            Ok(true)
         })
     }
 
@@ -596,21 +675,23 @@ impl ReplayStore for SqliteReplayStore {
         wall_now_ms: u64,
         mono_now_ms: u64,
     ) -> BoxFuture<'a, Result<usize, ReplayError>> {
+        let boot_id = self.boot_id;
+        let wall_i64 = i64::try_from(wall_now_ms).unwrap_or(i64::MAX);
+        let mono_i64 = i64::try_from(mono_now_ms).unwrap_or(i64::MAX);
         Box::pin(async move {
-            let wall_i64 = i64::try_from(wall_now_ms).unwrap_or(i64::MAX);
-            let mono_i64 = i64::try_from(mono_now_ms).unwrap_or(i64::MAX);
-            let res = sqlx::query(
-                "DELETE FROM webhook_nonces \
-                 WHERE (boot_id != ?1 AND expires_at_ms <= ?2) \
-                    OR (boot_id = ?1 AND expires_at_ms <= ?2 AND mono_expires_ms <= ?3)",
-            )
-            .bind(self.boot_id.as_slice())
-            .bind(wall_i64)
-            .bind(mono_i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ReplayError::Backend(e.to_string()))?;
-            Ok(usize::try_from(res.rows_affected()).unwrap_or(usize::MAX))
+            self.handle
+                .run(move |conn| {
+                    let deleted = conn
+                        .execute(
+                            "DELETE FROM webhook_nonces \
+                             WHERE (boot_id != ?1 AND expires_at_ms <= ?2) \
+                                OR (boot_id = ?1 AND expires_at_ms <= ?2 AND mono_expires_ms <= ?3)",
+                            params![boot_id.as_slice(), wall_i64, mono_i64],
+                        )
+                        .map_err(|e| ReplayError::Backend(e.to_string()))?;
+                    Ok(deleted)
+                })
+                .await
         })
     }
 }

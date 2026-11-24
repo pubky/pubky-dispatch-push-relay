@@ -17,11 +17,12 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt as _;
-use p256::ecdsa::signature::Verifier as _;
-use p256::pkcs8::EncodePrivateKey as _;
 use parking_lot::Mutex;
-use rand_core::OsRng;
-use ring::signature::{KeyPair as _, RSA_PKCS1_2048_8192_SHA256, RsaKeyPair, UnparsedPublicKey};
+use ring::rand::SystemRandom;
+use ring::signature::{
+    ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _,
+    RSA_PKCS1_2048_8192_SHA256, RsaKeyPair, UnparsedPublicKey,
+};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower::ServiceExt as _;
@@ -44,6 +45,14 @@ use pubky_dispatch_push_relay::time::format_rfc3339;
 
 const RELAY_ORIGIN: &str = "https://push.example";
 const NOW_MS: u64 = 1_767_225_960_000;
+
+/// Dummy test-only P-256 PKCS#8 private key for mock APNs ES256 JWT tests.
+const TEST_P256_PKCS8_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqqAO++8h+XsXLStn
+Gp0X0DGtKQytjLTKJkmEHtPgH82hRANCAATDU5zOZ/4OQlLrWs54n25PpWLNjV8R
+JuPZpk8VOSsbnrqvn8wbb67SMGiIvO0fc+LfUdrStgDJKPZM4+epIvG/
+-----END PRIVATE KEY-----";
 
 /// Dummy test-only 2048-bit RSA PKCS#8 private key for mock FCM OAuth2 JWT tests.
 const TEST_RSA_2048_PEM: &str = "\
@@ -135,7 +144,24 @@ async fn mock_apns_handler(
     }
 }
 
-fn verify_es256_jwt(jwt: &str, verifying_key: &p256::ecdsa::VerifyingKey) -> (Value, Value) {
+fn p256_public_bytes_from_pkcs8_pem(pem: &str) -> Vec<u8> {
+    let inner = pem
+        .split("-----BEGIN PRIVATE KEY-----")
+        .nth(1)
+        .unwrap()
+        .split("-----END PRIVATE KEY-----")
+        .next()
+        .unwrap();
+    let compact: String = inner.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .unwrap();
+    let rng = SystemRandom::new();
+    let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &der, &rng).unwrap();
+    kp.public_key().as_ref().to_vec()
+}
+
+fn verify_es256_jwt(jwt: &str, public_key_bytes: &[u8]) -> (Value, Value) {
     let parts: Vec<&str> = jwt.split('.').collect();
     assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts");
 
@@ -148,22 +174,18 @@ fn verify_es256_jwt(jwt: &str, verifying_key: &p256::ecdsa::VerifyingKey) -> (Va
         "ES256 JWS signature must be 64 raw bytes"
     );
 
-    let sig = p256::ecdsa::Signature::from_slice(&sig_bytes).unwrap();
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    verifying_key
-        .verify(signing_input.as_bytes(), &sig)
+    let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, public_key_bytes);
+    verifier
+        .verify(signing_input.as_bytes(), &sig_bytes)
         .expect("ES256 JWT signature must verify");
     (header, claims)
 }
 
 #[tokio::test]
 async fn apns_defaults_to_visible_alert_caches_jwt_and_classifies_every_response() {
-    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let verifying_key = *signing_key.verifying_key();
-    let pem = signing_key
-        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
-        .unwrap()
-        .to_string();
+    let pem = TEST_P256_PKCS8_PEM.to_owned();
+    let verifying_key = p256_public_bytes_from_pkcs8_pem(&pem);
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let prod_responses = Arc::new(Mutex::new(VecDeque::new()));
