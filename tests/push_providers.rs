@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use axum::response::IntoResponse as _;
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -34,6 +35,7 @@ use pubky_dispatch_push_relay::crypto::{
     SIGNATURE_HEADER, SIGNING_LABEL, b64_decode, b64_encode, sign_webhook,
 };
 use pubky_dispatch_push_relay::http::{RelayState, router};
+use pubky_dispatch_push_relay::metrics::WebhookOutcome;
 use pubky_dispatch_push_relay::push::RouterPushSender;
 use pubky_dispatch_push_relay::push::apns::{
     APNS_JWT_TTL_SECS, ApnsConfig, ApnsPushMode, ApnsSender,
@@ -294,6 +296,17 @@ async fn apns_defaults_to_visible_alert_caches_jwt_and_classifies_every_response
         assert_eq!(hdr["kid"], "KEY1234567");
         assert_eq!(claims["iss"], "TEAM987654");
         assert_eq!(claims["iat"], NOW_MS / 1_000);
+
+        let jwt_second = reqs[1]
+            .authorization
+            .strip_prefix("bearer ")
+            .expect("bearer prefix");
+        let (_, claims_second) = verify_es256_jwt(jwt_second, &verifying_key);
+        assert_eq!(
+            claims_second["iat"],
+            NOW_MS / 1_000,
+            "second request at t+5s must reuse cached JWT with original iat"
+        );
     }
 
     // 3. Advance clock past JWT TTL -> fresh JWT minted with updated `iat`.
@@ -736,6 +749,503 @@ async fn fcm_signs_with_ring_caches_token_coalesces_bursts_and_classifies_every_
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["pruned"], true);
     assert!(store.get(&handle2).await.unwrap().is_none());
+}
+
+type ScriptedHttpResp = (StatusCode, Option<String>, String);
+
+#[derive(Clone)]
+struct BackoffMockState {
+    hits: Arc<AtomicUsize>,
+    seen_auths: Arc<Mutex<Vec<String>>>,
+    responses: Arc<Mutex<VecDeque<ScriptedHttpResp>>>,
+    /// Optional barrier + release notify for synchronizing two concurrent stale-token requests.
+    barrier: Option<Arc<tokio::sync::Barrier>>,
+    stale_release: Option<Arc<tokio::sync::Notify>>,
+    first_seen_token: Arc<Mutex<Option<String>>>,
+    first_task_finished: Arc<AtomicUsize>,
+    /// Optional clock bumped by the barrier leader once both gen-1 requests have arrived.
+    bump_clock_on_leader: Option<(Arc<FixedClock>, u64)>,
+}
+
+async fn backoff_mock_handler(
+    State(state): State<BackoffMockState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    state.seen_auths.lock().push(auth.clone());
+
+    if let (Some(barrier), Some(release)) = (&state.barrier, &state.stale_release) {
+        // Hold the first two concurrent calls carrying the initial token so both observe
+        // generation 1 before either invalidates it.
+        let is_initial = {
+            let mut first = state.first_seen_token.lock();
+            match first.as_ref() {
+                None => {
+                    *first = Some(auth.clone());
+                    true
+                }
+                Some(tok) => tok == &auth,
+            }
+        };
+        if is_initial {
+            let wait_res = barrier.wait().await;
+            if wait_res.is_leader() {
+                if let Some((clk, new_ms)) = &state.bump_clock_on_leader {
+                    clk.set(*new_ms);
+                }
+                // Leader gets 403/401 immediately, refreshes to gen 2, and succeeds.
+                let (status, retry_after, body) = state.responses.lock().pop_front().unwrap_or((
+                    StatusCode::OK,
+                    None,
+                    "{}".to_owned(),
+                ));
+                return build_mock_response(status, retry_after, body);
+            }
+            // Follower waits until leader has already refreshed & succeeded with gen 2,
+            // then receives its own stale 403/401 for gen 1.
+            release.notified().await;
+            let (status, retry_after, body) = state.responses.lock().pop_front().unwrap_or((
+                StatusCode::OK,
+                None,
+                "{}".to_owned(),
+            ));
+            return build_mock_response(status, retry_after, body);
+        }
+
+        // Subsequent calls carry generation 2: mark leader done and wake follower!
+        if state.first_task_finished.fetch_add(1, Ordering::SeqCst) == 0 {
+            release.notify_one();
+        }
+        return build_mock_response(StatusCode::OK, None, "{}".to_owned());
+    }
+
+    let (status, retry_after, body) =
+        state
+            .responses
+            .lock()
+            .pop_front()
+            .unwrap_or((StatusCode::OK, None, "{}".to_owned()));
+    build_mock_response(status, retry_after, body)
+}
+
+fn build_mock_response(
+    status: StatusCode,
+    retry_after: Option<String>,
+    body: String,
+) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    if let Some(ra) = retry_after {
+        headers.insert(
+            HeaderName::from_static("retry-after"),
+            HeaderValue::from_str(&ra).unwrap(),
+        );
+    }
+    (status, headers, body).into_response()
+}
+
+#[tokio::test]
+async fn apns_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_readiness() {
+    let clock = Arc::new(FixedClock::new(NOW_MS));
+
+    // --- Part A: Retry-After (delta seconds + HTTP-date) backoff and provider readiness ---
+    let mock_a = BackoffMockState {
+        hits: Arc::new(AtomicUsize::new(0)),
+        seen_auths: Arc::new(Mutex::new(Vec::new())),
+        responses: Arc::new(Mutex::new(VecDeque::new())),
+        barrier: None,
+        stale_release: None,
+        first_seen_token: Arc::new(Mutex::new(None)),
+        first_task_finished: Arc::new(AtomicUsize::new(0)),
+        bump_clock_on_leader: None,
+    };
+    let url_a = spawn_mock_server(
+        Router::new()
+            .route("/3/device/{token}", post(backoff_mock_handler))
+            .with_state(mock_a.clone()),
+    )
+    .await;
+
+    let mut cfg = ApnsConfig::new(
+        "TEAM987654".to_owned(),
+        "KEY1234567".to_owned(),
+        "com.example.wallet".to_owned(),
+        Zeroizing::new(TEST_P256_PKCS8_PEM.to_owned()),
+        ApnsEnv::Production,
+    );
+    cfg.production_url = url_a.clone();
+    cfg.sandbox_url = url_a;
+
+    let sender = Arc::new(ApnsSender::with_clock(cfg, clock.clone()).unwrap());
+    let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let state = RelayState::new(
+        store,
+        Arc::new(RouterPushSender::new().with_apns(sender)),
+        clock.clone(),
+        RelaySettings::new(RELAY_ORIGIN).unwrap(),
+    );
+    let app = router(state.clone());
+
+    let push_key = SigningKey::from_bytes(&[88u8; 32]);
+    let handle = register_via_http(&app, "apns", &"dd".repeat(32), &push_key, None).await;
+
+    // 1. 429 with Retry-After: 30 triggers 30s backoff.
+    mock_a.responses.lock().push_back((
+        StatusCode::TOO_MANY_REQUESTS,
+        Some("30".to_owned()),
+        json!({"reason": "TooManyRequests"}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, NOW_MS, [1; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 1);
+
+    // 5 seconds later: still inside backoff -> short-circuits locally without calling APNs!
+    let t_plus_5 = NOW_MS + 5_000;
+    clock.set(t_plus_5);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_5, [2; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        mock_a.hits.load(Ordering::SeqCst),
+        1,
+        "provider must not be called while Retry-After backoff is active"
+    );
+    assert_eq!(
+        state
+            .metrics()
+            .webhook_count(WebhookOutcome::ProviderBackoff),
+        1
+    );
+
+    // 30 seconds after 429: backoff expired -> resumes calling APNs and succeeds!
+    let t_plus_30 = NOW_MS + 30_000;
+    clock.set(t_plus_30);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_30, [3; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 2);
+
+    // 2. 503 with HTTP-date Retry-After (+45s = 2026-01-01 00:07:15 GMT).
+    mock_a.responses.lock().push_back((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("Thu, 01 Jan 2026 00:07:15 GMT".to_owned()),
+        json!({"reason": "ServiceUnavailable"}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_30, [4; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
+
+    let t_plus_50 = t_plus_30 + 20_000;
+    clock.set(t_plus_50);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_50, [5; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 3);
+
+    let t_plus_75 = t_plus_30 + 45_000;
+    clock.set(t_plus_75);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_75, [6; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 4);
+
+    // 3. Readiness fails on InvalidProviderToken.
+    let ready_before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_before.status(), StatusCode::OK);
+
+    mock_a.responses.lock().push_back((
+        StatusCode::FORBIDDEN,
+        None,
+        json!({"reason": "InvalidProviderToken"}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_75, [7; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    let ready_after = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_after.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // --- Part B: Concurrent ExpiredProviderToken does not invalidate freshly refreshed JWT ---
+    let race_clock = Arc::new(FixedClock::new(NOW_MS));
+    let mock_b = BackoffMockState {
+        hits: Arc::new(AtomicUsize::new(0)),
+        seen_auths: Arc::new(Mutex::new(Vec::new())),
+        responses: Arc::new(Mutex::new(VecDeque::from([
+            (
+                StatusCode::FORBIDDEN,
+                None,
+                json!({"reason": "ExpiredProviderToken"}).to_string(),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                None,
+                json!({"reason": "ExpiredProviderToken"}).to_string(),
+            ),
+        ]))),
+        barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        stale_release: Some(Arc::new(tokio::sync::Notify::new())),
+        first_seen_token: Arc::new(Mutex::new(None)),
+        first_task_finished: Arc::new(AtomicUsize::new(0)),
+        bump_clock_on_leader: Some((race_clock.clone(), NOW_MS + 1_000)),
+    };
+    let url_b = spawn_mock_server(
+        Router::new()
+            .route("/3/device/{token}", post(backoff_mock_handler))
+            .with_state(mock_b.clone()),
+    )
+    .await;
+
+    let mut race_cfg = ApnsConfig::new(
+        "TEAM987654".to_owned(),
+        "KEY1234567".to_owned(),
+        "com.example.wallet".to_owned(),
+        Zeroizing::new(TEST_P256_PKCS8_PEM.to_owned()),
+        ApnsEnv::Production,
+    );
+    race_cfg.production_url = url_b.clone();
+    race_cfg.sandbox_url = url_b;
+    let race_sender = Arc::new(ApnsSender::with_clock(race_cfg, race_clock.clone()).unwrap());
+    let race_store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let race_app = router(RelayState::new(
+        race_store,
+        Arc::new(RouterPushSender::new().with_apns(race_sender)),
+        race_clock.clone(),
+        RelaySettings::new(RELAY_ORIGIN).unwrap(),
+    ));
+    let race_handle = register_via_http(&race_app, "apns", &"ee".repeat(32), &push_key, None).await;
+
+    let app1 = race_app.clone();
+    let app2 = race_app.clone();
+    let k1 = push_key.clone();
+    let k2 = push_key.clone();
+    let h1 = race_handle.clone();
+    let h2 = race_handle.clone();
+    let (r1, r2) = tokio::join!(
+        send_hook_via_http(&app1, &k1, &h1, NOW_MS, [20; 16]),
+        send_hook_via_http(&app2, &k2, &h2, NOW_MS, [21; 16]),
+    );
+    assert_eq!(r1.0, StatusCode::OK);
+    assert_eq!(r2.0, StatusCode::OK);
+
+    // Advance clock another +1s: if task B's stale 403 had wrongly wiped gen 2, a 3rd call
+    // would mint gen 3 with a brand-new JWT; instead it MUST reuse gen 2!
+    let t_plus_2 = NOW_MS + 2_000;
+    race_clock.set(t_plus_2);
+    let (s3, _) = send_hook_via_http(&race_app, &push_key, &race_handle, t_plus_2, [22; 16]).await;
+    assert_eq!(s3, StatusCode::OK);
+
+    let auths = mock_b.seen_auths.lock().clone();
+    assert_eq!(auths.len(), 5);
+    let gen1 = &auths[0];
+    assert_eq!(auths[1], *gen1, "both initial concurrent pushes used gen 1");
+    let gen2 = &auths[2];
+    assert_ne!(gen2, gen1, "leader refreshed to gen 2");
+    assert_eq!(
+        &auths[3], gen2,
+        "stale follower retry must reuse gen 2 instead of wiping it"
+    );
+    assert_eq!(
+        &auths[4], gen2,
+        "subsequent push must still hit cached gen 2 (not mint gen 3)"
+    );
+}
+
+#[tokio::test]
+async fn fcm_honors_retry_after_backoff_guards_concurrent_refresh_and_tracks_readiness() {
+    let clock = Arc::new(FixedClock::new(NOW_MS));
+    let token_counter = Arc::new(AtomicUsize::new(0));
+    let oauth_state = MockFcmState {
+        token_requests: Arc::new(Mutex::new(Vec::new())),
+        token_counter: token_counter.clone(),
+        fcm_requests: Arc::new(Mutex::new(Vec::new())),
+        fcm_responses: Arc::new(Mutex::new(VecDeque::new())),
+    };
+
+    // --- Part A: Retry-After backoff & readiness ---
+    let mock_a = BackoffMockState {
+        hits: Arc::new(AtomicUsize::new(0)),
+        seen_auths: Arc::new(Mutex::new(Vec::new())),
+        responses: Arc::new(Mutex::new(VecDeque::new())),
+        barrier: None,
+        stale_release: None,
+        first_seen_token: Arc::new(Mutex::new(None)),
+        first_task_finished: Arc::new(AtomicUsize::new(0)),
+        bump_clock_on_leader: None,
+    };
+    let server_a = spawn_mock_server(
+        Router::new()
+            .route(
+                "/token",
+                post(mock_oauth_handler).with_state(oauth_state.clone()),
+            )
+            .route(
+                "/v1/projects/{project}/messages:send",
+                post(backoff_mock_handler).with_state(mock_a.clone()),
+            ),
+    )
+    .await;
+
+    let mut cfg = FcmConfig::new(FcmServiceAccount {
+        project_id: "demo-proj".to_owned(),
+        client_email: "relay@demo-proj.iam.gserviceaccount.com".to_owned(),
+        private_key: Zeroizing::new(TEST_RSA_2048_PEM.to_owned()),
+        token_uri: Some(format!("{server_a}/token")),
+    });
+    cfg.api_base_url = server_a;
+
+    let sender = Arc::new(FcmSender::with_clock(cfg, clock.clone()).unwrap());
+    let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let state = RelayState::new(
+        store,
+        Arc::new(RouterPushSender::new().with_fcm(sender)),
+        clock.clone(),
+        RelaySettings::new(RELAY_ORIGIN).unwrap(),
+    );
+    let app = router(state.clone());
+    let push_key = SigningKey::from_bytes(&[89u8; 32]);
+    let handle = register_via_http(&app, "fcm", "fcm-backoff-token", &push_key, None).await;
+
+    // 429 with Retry-After: 45 -> short-circuits locally until 45s pass.
+    mock_a.responses.lock().push_back((
+        StatusCode::TOO_MANY_REQUESTS,
+        Some("45".to_owned()),
+        json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, NOW_MS, [1; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 1);
+
+    let t_plus_10 = NOW_MS + 10_000;
+    clock.set(t_plus_10);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_10, [2; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state
+            .metrics()
+            .webhook_count(WebhookOutcome::ProviderBackoff),
+        1
+    );
+
+    let t_plus_45 = NOW_MS + 45_000;
+    clock.set(t_plus_45);
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_45, [3; 16]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(mock_a.hits.load(Ordering::SeqCst), 2);
+
+    // Readiness flips to 503 after upstream 403 auth failure.
+    mock_a.responses.lock().push_back((
+        StatusCode::FORBIDDEN,
+        None,
+        json!({"error": {"code": 403, "status": "PERMISSION_DENIED"}}).to_string(),
+    ));
+    let (s, _) = send_hook_via_http(&app, &push_key, &handle, t_plus_45, [4; 16]).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // --- Part B: Concurrent 401 does NOT wipe freshly refreshed OAuth token ---
+    let race_token_counter = Arc::new(AtomicUsize::new(0));
+    let race_oauth = MockFcmState {
+        token_requests: Arc::new(Mutex::new(Vec::new())),
+        token_counter: race_token_counter.clone(),
+        fcm_requests: Arc::new(Mutex::new(Vec::new())),
+        fcm_responses: Arc::new(Mutex::new(VecDeque::new())),
+    };
+    let mock_b = BackoffMockState {
+        hits: Arc::new(AtomicUsize::new(0)),
+        seen_auths: Arc::new(Mutex::new(Vec::new())),
+        responses: Arc::new(Mutex::new(VecDeque::from([
+            (StatusCode::UNAUTHORIZED, None, "{}".to_owned()),
+            (StatusCode::UNAUTHORIZED, None, "{}".to_owned()),
+        ]))),
+        barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        stale_release: Some(Arc::new(tokio::sync::Notify::new())),
+        first_seen_token: Arc::new(Mutex::new(None)),
+        first_task_finished: Arc::new(AtomicUsize::new(0)),
+        bump_clock_on_leader: None,
+    };
+    let server_b = spawn_mock_server(
+        Router::new()
+            .route("/token", post(mock_oauth_handler).with_state(race_oauth))
+            .route(
+                "/v1/projects/{project}/messages:send",
+                post(backoff_mock_handler).with_state(mock_b.clone()),
+            ),
+    )
+    .await;
+
+    let race_clock = Arc::new(FixedClock::new(NOW_MS));
+    let mut race_cfg = FcmConfig::new(FcmServiceAccount {
+        project_id: "demo-proj".to_owned(),
+        client_email: "relay@demo-proj.iam.gserviceaccount.com".to_owned(),
+        private_key: Zeroizing::new(TEST_RSA_2048_PEM.to_owned()),
+        token_uri: Some(format!("{server_b}/token")),
+    });
+    race_cfg.api_base_url = server_b;
+    let race_sender = Arc::new(FcmSender::with_clock(race_cfg, race_clock.clone()).unwrap());
+    let race_store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let race_app = router(RelayState::new(
+        race_store,
+        Arc::new(RouterPushSender::new().with_fcm(race_sender)),
+        race_clock,
+        RelaySettings::new(RELAY_ORIGIN).unwrap(),
+    ));
+    let race_handle = register_via_http(&race_app, "fcm", "fcm-race-token", &push_key, None).await;
+
+    let app1 = race_app.clone();
+    let app2 = race_app.clone();
+    let k1 = push_key.clone();
+    let k2 = push_key.clone();
+    let h1 = race_handle.clone();
+    let h2 = race_handle.clone();
+    let (r1, r2) = tokio::join!(
+        send_hook_via_http(&app1, &k1, &h1, NOW_MS, [30; 16]),
+        send_hook_via_http(&app2, &k2, &h2, NOW_MS, [31; 16]),
+    );
+    assert_eq!(r1.0, StatusCode::OK);
+    assert_eq!(r2.0, StatusCode::OK);
+
+    // Crucial assertion: OAuth token exchange happened ONCE initially and ONCE on leader
+    // refresh (total == 2), NOT 3 times!
+    assert_eq!(
+        race_token_counter.load(Ordering::SeqCst),
+        2,
+        "stale concurrent 401 must not invalidate the freshly refreshed OAuth token"
+    );
+    let auths = mock_b.seen_auths.lock().clone();
+    assert_eq!(auths[0], "Bearer mock-oauth-token-1");
+    assert_eq!(auths[1], "Bearer mock-oauth-token-1");
+    assert_eq!(auths[2], "Bearer mock-oauth-token-2");
+    assert_eq!(auths[3], "Bearer mock-oauth-token-2");
 }
 
 async fn register_via_http(

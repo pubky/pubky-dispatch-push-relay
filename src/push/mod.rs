@@ -6,10 +6,12 @@ pub mod noop;
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
 use crate::store::{BoxFuture, Platform, Registration};
+use crate::time::parse_http_date_ms;
 
 /// Default per-delivery provider timeout (3.5 s), strictly below the Dispatch service's
 /// 5-second webhook timeout (Wire Format §8.2).
@@ -18,6 +20,9 @@ pub const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 3_500;
 /// Maximum permitted `PROVIDER_TIMEOUT_MS` so provider calls stay bounded below Dispatch's
 /// 5-second webhook timeout.
 pub const MAX_PROVIDER_TIMEOUT_MS: u64 = 4_500;
+
+/// Maximum backoff duration honoured from a single upstream `Retry-After` header (5 minutes).
+pub const MAX_PROVIDER_BACKOFF_MS: u64 = 300_000;
 
 /// Fixed classification for token-specific provider rejections that justify handle pruning.
 ///
@@ -72,6 +77,8 @@ pub enum UpstreamErrorClass {
     Http5xx,
     /// Provider returned a malformed response payload.
     BadResponse,
+    /// Provider is currently backing off after an upstream `Retry-After` response.
+    Backoff,
 }
 
 impl UpstreamErrorClass {
@@ -86,6 +93,7 @@ impl UpstreamErrorClass {
             Self::Http4xx => "http_4xx",
             Self::Http5xx => "http_5xx",
             Self::BadResponse => "bad_response",
+            Self::Backoff => "backoff",
         }
     }
 }
@@ -157,6 +165,62 @@ pub const fn classify_http_status(status: u16) -> UpstreamErrorClass {
     }
 }
 
+/// Parses an upstream `Retry-After` header (either integer delta-seconds or an IMF-fixdate
+/// HTTP date) into a bounded backoff duration in milliseconds.
+///
+/// Returns `None` if the header is absent, malformed, or specifies a zero/past delay.
+#[must_use]
+pub fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap, wall_now_ms: u64) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let delay_ms = if let Ok(secs) = raw.parse::<u64>() {
+        secs.saturating_mul(1_000)
+    } else {
+        let target_ms = parse_http_date_ms(raw)?;
+        target_ms.saturating_sub(wall_now_ms)
+    };
+
+    if delay_ms == 0 {
+        None
+    } else {
+        Some(delay_ms.min(MAX_PROVIDER_BACKOFF_MS))
+    }
+}
+
+/// Lock-free monotonic per-provider backoff tracker driven by upstream `Retry-After` headers.
+#[derive(Debug, Default)]
+pub struct ProviderBackoff {
+    until_mono_ms: AtomicU64,
+}
+
+impl ProviderBackoff {
+    /// Creates an inactive backoff tracker.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            until_mono_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns `true` if `mono_now_ms` is still inside an active backoff window.
+    #[must_use]
+    pub fn is_backing_off(&self, mono_now_ms: u64) -> bool {
+        self.until_mono_ms.load(Ordering::Acquire) > mono_now_ms
+    }
+
+    /// Records a backoff ending at `mono_now_ms + delay_ms`, never shortening an active backoff.
+    pub fn record(&self, mono_now_ms: u64, delay_ms: u64) {
+        if delay_ms == 0 {
+            return;
+        }
+        let target = mono_now_ms.saturating_add(delay_ms);
+        self.until_mono_ms.fetch_max(target, Ordering::Release);
+    }
+}
+
 /// Abstraction over mobile push notification delivery backends (APNs, FCM, no-op/mock).
 pub trait PushSender: Send + Sync {
     /// Dispatches a content-free wake push for `registration`.
@@ -164,6 +228,16 @@ pub trait PushSender: Send + Sync {
         &'a self,
         registration: &'a Registration,
     ) -> BoxFuture<'a, Result<PushOutcome, PushError>>;
+
+    /// Verifies that the configured provider credentials and signing state are ready to serve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PushError`] if credentials are missing, cannot sign, or have been rejected by
+    /// the upstream provider.
+    fn check_ready(&self) -> Result<(), PushError> {
+        Ok(())
+    }
 }
 
 /// Composite [`PushSender`] routing APNs and FCM registrations to their respective backends.
@@ -227,5 +301,64 @@ impl PushSender for RouterPushSender {
                 },
             }
         })
+    }
+
+    fn check_ready(&self) -> Result<(), PushError> {
+        if !self.has_any_provider() {
+            return Err(PushError::Config("no push providers configured".to_owned()));
+        }
+        if let Some(apns) = &self.apns {
+            apns.check_ready()?;
+        }
+        if let Some(fcm) = &self.fcm {
+            fcm.check_ready()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn parses_retry_after_delta_seconds_http_date_and_caps() {
+        let now_ms = 1_767_225_960_000; // Thu, 01 Jan 2026 00:06:00 GMT
+
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("30"));
+        assert_eq!(parse_retry_after_ms(&h, now_ms), Some(30_000));
+
+        h.insert("retry-after", HeaderValue::from_static("999999"));
+        assert_eq!(
+            parse_retry_after_ms(&h, now_ms),
+            Some(MAX_PROVIDER_BACKOFF_MS)
+        );
+
+        h.insert("retry-after", HeaderValue::from_static("0"));
+        assert_eq!(parse_retry_after_ms(&h, now_ms), None);
+
+        h.insert(
+            "retry-after",
+            HeaderValue::from_static("Thu, 01 Jan 2026 00:06:45 GMT"),
+        );
+        assert_eq!(parse_retry_after_ms(&h, now_ms), Some(45_000));
+
+        h.insert(
+            "retry-after",
+            HeaderValue::from_static("Thu, 01 Jan 2026 00:05:00 GMT"),
+        );
+        assert_eq!(parse_retry_after_ms(&h, now_ms), None);
+    }
+
+    #[test]
+    fn provider_backoff_tracks_monotonic_window() {
+        let backoff = ProviderBackoff::new();
+        assert!(!backoff.is_backing_off(0));
+        backoff.record(0, 30_000);
+        assert!(backoff.is_backing_off(0));
+        assert!(backoff.is_backing_off(29_999));
+        assert!(!backoff.is_backing_off(30_000));
     }
 }

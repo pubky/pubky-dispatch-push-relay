@@ -13,6 +13,7 @@ FROM rust:1.91.1-slim-bookworm AS build
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock clippy.toml ./
+COPY migrations ./migrations
 COPY src ./src
 
 RUN cargo build --release --locked \

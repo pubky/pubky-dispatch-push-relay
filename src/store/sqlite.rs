@@ -4,9 +4,10 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use ring::digest::{SHA256, digest};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
 use super::{
@@ -15,41 +16,102 @@ use super::{
 };
 use crate::replay::{NONCE_TTL_MS, ReplayError, ReplayStore};
 
-const REGISTRATIONS_TABLE_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS registrations (
-    handle            TEXT PRIMARY KEY NOT NULL,
-    platform          TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
-    device_token      TEXT NOT NULL,
-    push_key          BLOB NOT NULL CHECK (length(push_key) = 32),
-    apns_env          TEXT CHECK (apns_env IS NULL OR apns_env IN ('production', 'sandbox')),
-    created_at_ms     INTEGER NOT NULL,
-    last_active_at_ms INTEGER NOT NULL
+struct SqlMigration {
+    version: i64,
+    description: &'static str,
+    sql: &'static str,
+}
+
+const SQLITE_MIGRATIONS: &[SqlMigration] = &[SqlMigration {
+    version: 1,
+    description: "initial",
+    sql: include_str!("../../migrations/sqlite/0001_initial.sql"),
+}];
+
+const SCHEMA_MIGRATIONS_TABLE_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version       INTEGER PRIMARY KEY NOT NULL,
+    description   TEXT NOT NULL,
+    checksum      TEXT NOT NULL,
+    applied_at_ms INTEGER NOT NULL
 ) STRICT;
 ";
 
-const REGISTRATIONS_INDEX_KEY_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_registrations_push_key
-    ON registrations (push_key);
-";
+fn migration_checksum_hex(sql: &str) -> String {
+    let sum = digest(&SHA256, sql.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in sum.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
-const REGISTRATIONS_INDEX_ACTIVE_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_registrations_last_active
-    ON registrations (last_active_at_ms);
-";
+fn current_epoch_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
 
-const NONCES_TABLE_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS webhook_nonces (
-    nonce           BLOB PRIMARY KEY NOT NULL CHECK (length(nonce) = 16),
-    expires_at_ms   INTEGER NOT NULL,
-    boot_id         BLOB NOT NULL CHECK (length(boot_id) = 16),
-    mono_expires_ms INTEGER NOT NULL
-) STRICT;
-";
+fn apply_sqlite_migrations(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("failed to begin migration transaction: {e}"))?;
 
-const NONCES_INDEX_SQL: &str = r"
-CREATE INDEX IF NOT EXISTS idx_webhook_nonces_expires_at
-    ON webhook_nonces (expires_at_ms);
-";
+    tx.execute_batch(SCHEMA_MIGRATIONS_TABLE_SQL)
+        .map_err(|e| format!("failed to create schema_migrations table: {e}"))?;
+
+    for migration in SQLITE_MIGRATIONS {
+        let expected_checksum = migration_checksum_hex(migration.sql);
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = ?1",
+                params![migration.version],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to query schema_migrations: {e}"))?;
+
+        if let Some(found) = existing {
+            if found != expected_checksum {
+                return Err(format!(
+                    "SQLite migration {} ({}) checksum mismatch: database has {found}, binary expects {expected_checksum}",
+                    migration.version, migration.description
+                ));
+            }
+            continue;
+        }
+
+        tx.execute_batch(migration.sql).map_err(|e| {
+            format!(
+                "failed to apply SQLite migration {} ({}): {e}",
+                migration.version, migration.description
+            )
+        })?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, description, checksum, applied_at_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                migration.version,
+                migration.description,
+                expected_checksum,
+                current_epoch_ms_i64()
+            ],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to record SQLite migration {}: {e}",
+                migration.version
+            )
+        })?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit SQLite migrations: {e}"))?;
+    Ok(())
+}
 
 /// Shared thread-safe SQLite connection handle used by [`SqliteStore`] and [`SqliteReplayStore`].
 #[derive(Clone)]
@@ -106,12 +168,7 @@ impl SqliteStore {
         };
 
         handle
-            .run(|conn| {
-                conn.execute_batch(&format!(
-                    "{REGISTRATIONS_TABLE_SQL}\n{REGISTRATIONS_INDEX_KEY_SQL}\n{REGISTRATIONS_INDEX_ACTIVE_SQL}"
-                ))
-                .map_err(|e| StoreError::Backend(format!("failed to initialize schema: {e}")))
-            })
+            .run(|conn| apply_sqlite_migrations(conn).map_err(StoreError::Backend))
             .await?;
 
         Ok(Self { handle })
@@ -579,12 +636,7 @@ impl SqliteReplayStore {
             .map_err(|_| ReplayError::Backend("failed to generate boot_id".to_owned()))?;
 
         handle
-            .run(|conn| {
-                conn.execute_batch(&format!("{NONCES_TABLE_SQL}\n{NONCES_INDEX_SQL}"))
-                    .map_err(|e| {
-                        ReplayError::Backend(format!("failed to init webhook_nonces: {e}"))
-                    })
-            })
+            .run(|conn| apply_sqlite_migrations(conn).map_err(ReplayError::Backend))
             .await?;
 
         Ok(Self {
@@ -857,5 +909,49 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn applies_versioned_migrations_idempotently_and_detects_checksum_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("migrated.sqlite");
+        let path_str = db_path.to_str().unwrap();
+
+        let store = SqliteStore::open(path_str).await.unwrap();
+        let versions: Vec<(i64, String)> = store
+            .pool()
+            .run(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT version, description FROM schema_migrations ORDER BY version")
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StoreError::Backend(e.to_string()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions, vec![(1, "initial".to_owned())]);
+
+        // Re-opening is idempotent.
+        let store2 = SqliteStore::open(path_str).await.unwrap();
+        store2.ping().await.unwrap();
+
+        // Checksum tampering causes startup migration verification to fail loudly.
+        store2
+            .pool()
+            .run(|conn| {
+                conn.execute(
+                    "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 1",
+                    [],
+                )
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+                Ok::<(), StoreError>(())
+            })
+            .await
+            .unwrap();
+        let err = SqliteStore::open(path_str).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
     }
 }

@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod error;
 pub mod http;
 pub mod json;
+pub mod metrics;
 pub mod push;
 pub mod rate_limit;
 pub mod replay;
@@ -27,4 +28,4 @@ pub mod time;
 
 pub use config::{ProtocolConfig, RelaySettings};
 pub use crypto::{SIGNATURE_HEADER, SIGNING_LABEL};
-pub use http::{RateLimitBackends, RelayState, router};
+pub use http::{RateLimitBackends, RelayState, metrics_router, router};

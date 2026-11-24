@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -16,8 +17,8 @@ use zeroize::Zeroizing;
 use crate::clock::{Clock, SystemClock};
 use crate::crypto::b64_encode;
 use crate::push::{
-    DEFAULT_PROVIDER_TIMEOUT_MS, InvalidTokenClass, PushError, PushOutcome, PushSender,
-    UpstreamErrorClass, classify_http_status,
+    DEFAULT_PROVIDER_TIMEOUT_MS, InvalidTokenClass, ProviderBackoff, PushError, PushOutcome,
+    PushSender, UpstreamErrorClass, classify_http_status, parse_retry_after_ms,
 };
 use crate::store::{BoxFuture, Registration};
 
@@ -98,6 +99,7 @@ impl FcmConfig {
 struct CachedAccessToken {
     token: Zeroizing<String>,
     expires_at_secs: u64,
+    generation: u64,
 }
 
 #[derive(Serialize)]
@@ -177,6 +179,9 @@ pub struct FcmSender {
     api_base_url: String,
     clock: Arc<dyn Clock>,
     token_cache: Mutex<Option<CachedAccessToken>>,
+    next_token_gen: AtomicU64,
+    backoff: ProviderBackoff,
+    auth_healthy: AtomicBool,
 }
 
 impl fmt::Debug for FcmSender {
@@ -261,6 +266,9 @@ impl FcmSender {
             api_base_url: config.api_base_url.trim_end_matches('/').to_owned(),
             clock,
             token_cache: Mutex::new(None),
+            next_token_gen: AtomicU64::new(0),
+            backoff: ProviderBackoff::new(),
+            auth_healthy: AtomicBool::new(true),
         })
     }
 
@@ -302,14 +310,21 @@ impl FcmSender {
         )))
     }
 
-    async fn access_token(&self) -> Result<Zeroizing<String>, PushError> {
+    async fn access_token(&self) -> Result<(Zeroizing<String>, u64), PushError> {
         let mut cache = self.token_cache.lock().await;
         let now_secs = self.clock.now_ms() / 1_000;
 
         if let Some(cached) = cache.as_ref()
             && now_secs.saturating_add(TOKEN_REFRESH_MARGIN_SECS) < cached.expires_at_secs
         {
-            return Ok(cached.token.clone());
+            return Ok((cached.token.clone(), cached.generation));
+        }
+
+        if self.backoff.is_backing_off(self.clock.monotonic_ms()) {
+            return Err(PushError::Upstream {
+                class: UpstreamErrorClass::Backoff,
+                status: None,
+            });
         }
 
         let assertion = self.build_jwt_assertion(now_secs)?;
@@ -335,8 +350,18 @@ impl FcmSender {
 
         let status = response.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
+            if matches!(status_code, 429 | 503)
+                && let Some(delay_ms) =
+                    parse_retry_after_ms(response.headers(), self.clock.now_ms())
+            {
+                self.backoff.record(self.clock.monotonic_ms(), delay_ms);
+            }
+            if matches!(status_code, 400 | 401 | 403) {
+                self.auth_healthy.store(false, Ordering::Relaxed);
+            }
             return Err(PushError::Auth {
-                class: classify_http_status(status.as_u16()),
+                class: classify_http_status(status_code),
             });
         }
 
@@ -362,19 +387,37 @@ impl FcmSender {
 
         let ttl_secs = parsed.expires_in.unwrap_or(3600);
         let token = parsed.access_token;
+        let generation = self.next_token_gen.fetch_add(1, Ordering::Relaxed) + 1;
         *cache = Some(CachedAccessToken {
             token: token.clone(),
             expires_at_secs: now_secs.saturating_add(ttl_secs),
+            generation,
         });
-        Ok(token)
+        self.auth_healthy.store(true, Ordering::Relaxed);
+        Ok((token, generation))
     }
 
-    async fn invalidate_access_token(&self) {
-        *self.token_cache.lock().await = None;
+    /// Invalidates the cached OAuth2 access token only if its generation matches
+    /// `failed_generation`, preventing a stale concurrent 401 from wiping a fresh token.
+    async fn invalidate_access_token_if_generation(&self, failed_generation: u64) {
+        let mut cache = self.token_cache.lock().await;
+        if cache
+            .as_ref()
+            .is_some_and(|cached| cached.generation == failed_generation)
+        {
+            *cache = None;
+        }
     }
 
     async fn send_once(&self, registration: &Registration) -> Result<FcmResponse, PushError> {
-        let access_token = self.access_token().await?;
+        if self.backoff.is_backing_off(self.clock.monotonic_ms()) {
+            return Err(PushError::Upstream {
+                class: UpstreamErrorClass::Backoff,
+                status: None,
+            });
+        }
+
+        let (access_token, generation) = self.access_token().await?;
         let auth_header = Zeroizing::new(format!("Bearer {}", access_token.as_str()));
         let url = format!(
             "{}/v1/projects/{}/messages:send",
@@ -414,12 +457,23 @@ impl FcmSender {
 
         let status = response.status();
         if status.is_success() {
+            self.auth_healthy.store(true, Ordering::Relaxed);
             return Ok(FcmResponse::Outcome(PushOutcome::Delivered));
         }
 
         let status_code = status.as_u16();
         if status_code == 401 {
-            return Ok(FcmResponse::Unauthorized);
+            return Ok(FcmResponse::Unauthorized { generation });
+        }
+
+        if matches!(status_code, 429 | 503)
+            && let Some(delay_ms) = parse_retry_after_ms(response.headers(), self.clock.now_ms())
+        {
+            self.backoff.record(self.clock.monotonic_ms(), delay_ms);
+        }
+
+        if status_code == 403 {
+            self.auth_healthy.store(false, Ordering::Relaxed);
         }
 
         let body_bytes = response.bytes().await.unwrap_or_default();
@@ -436,7 +490,7 @@ impl FcmSender {
 
 enum FcmResponse {
     Outcome(PushOutcome),
-    Unauthorized,
+    Unauthorized { generation: u64 },
 }
 
 /// Parses a PKCS#8 (`PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`) PEM private key into a
@@ -535,17 +589,30 @@ impl PushSender for FcmSender {
         Box::pin(async move {
             match self.send_once(registration).await? {
                 FcmResponse::Outcome(outcome) => Ok(outcome),
-                FcmResponse::Unauthorized => {
-                    self.invalidate_access_token().await;
+                FcmResponse::Unauthorized { generation } => {
+                    self.invalidate_access_token_if_generation(generation).await;
                     match self.send_once(registration).await? {
                         FcmResponse::Outcome(outcome) => Ok(outcome),
-                        FcmResponse::Unauthorized => Err(PushError::Auth {
-                            class: UpstreamErrorClass::Auth,
-                        }),
+                        FcmResponse::Unauthorized { .. } => {
+                            self.auth_healthy.store(false, Ordering::Relaxed);
+                            Err(PushError::Auth {
+                                class: UpstreamErrorClass::Auth,
+                            })
+                        }
                     }
                 }
             }
         })
+    }
+
+    fn check_ready(&self) -> Result<(), PushError> {
+        if !self.auth_healthy.load(Ordering::Relaxed) {
+            return Err(PushError::Auth {
+                class: UpstreamErrorClass::Auth,
+            });
+        }
+        self.build_jwt_assertion(self.clock.now_ms() / 1_000)
+            .map(|_| ())
     }
 }
 

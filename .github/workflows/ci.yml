@@ -21,9 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -32,21 +33,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  msrv:
+    name: MSRV (1.91.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: "1.91.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --all-targets --all-features --locked
 
   test:
     name: Test (SQLite)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --all-targets --locked
       - run: cargo test --doc --locked
 
@@ -72,10 +88,20 @@ jobs:
       TEST_DATABASE_URL: postgres://relay:relay@127.0.0.1:5432/relay_test
       REQUIRE_POSTGRES_TESTS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Verify REQUIRE_POSTGRES_TESTS fails loudly when TEST_DATABASE_URL is absent
+        run: |
+          cargo test --test postgres --locked --no-run
+          if env -u TEST_DATABASE_URL REQUIRE_POSTGRES_TESTS=1 cargo test --test postgres --locked postgres_store_crud_duplicate_and_concurrent_capacity_cap; then
+            echo "ERROR: PostgreSQL test unexpectedly passed without TEST_DATABASE_URL"
+            exit 1
+          fi
+      - name: Run full test suite against PostgreSQL
+        run: cargo test --all-targets --locked
 
   doc:
     name: Docs
@@ -84,9 +110,11 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo doc --no-deps --locked
 
   audit:
@@ -99,3 +127,31 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  container:
+    name: Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build container image
+        run: docker build -t pubky-dispatch-push-relay:ci .
+      - name: Smoke-test container health and metrics endpoints
+        run: |
+          cid=$(docker run -d --rm -p 18080:8080 -p 19090:9090 \
+            -e RELAY_ORIGIN=https://push.example \
+            -e PUSH_BACKEND=noop \
+            -e DATABASE_URL=:memory: \
+            -e METRICS_BIND_ADDR=0.0.0.0:9090 \
+            pubky-dispatch-push-relay:ci)
+          trap 'docker stop "$cid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health >/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:18080/health | grep -q '"ok"'
+          curl -fsS http://127.0.0.1:18080/health/ready | grep -q '"ok"'
+          curl -fsS http://127.0.0.1:18080/health/live | grep -q '"ok"'
+          curl -fsS http://127.0.0.1:19090/metrics | grep -q 'push_relay_webhooks_total'

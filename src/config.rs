@@ -274,6 +274,11 @@ pub struct CliArgs {
     #[arg(long, env = "RELAY_BIND_ADDR", default_value = "0.0.0.0:8080")]
     pub bind_addr: SocketAddr,
 
+    /// Optional separate socket address for the Prometheus `/metrics` endpoint
+    /// (for example `127.0.0.1:9090`). When unset, `/metrics` is not exposed.
+    #[arg(long, env = "METRICS_BIND_ADDR")]
+    pub metrics_bind_addr: Option<SocketAddr>,
+
     /// Exact public HTTPS origin of this relay (e.g. `https://push.example.com`).
     #[arg(long, env = "RELAY_ORIGIN")]
     pub relay_origin: String,
@@ -425,6 +430,7 @@ impl std::fmt::Debug for CliArgs {
         };
         f.debug_struct("CliArgs")
             .field("bind_addr", &self.bind_addr)
+            .field("metrics_bind_addr", &self.metrics_bind_addr)
             .field("relay_origin", &self.relay_origin)
             .field("database_url", &db_backend)
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)

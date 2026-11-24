@@ -118,6 +118,69 @@ pub fn parse_rfc3339(text: &str) -> Result<u64, TimeError> {
         .ok_or(TimeError::InvalidFormat)
 }
 
+/// Parses an RFC 9110 §5.6.7 IMF-fixdate HTTP date (e.g. `Wed, 21 Oct 2015 07:28:00 GMT`)
+/// into Unix milliseconds. Returns `None` if malformed or before Unix epoch.
+#[must_use]
+pub fn parse_http_date_ms(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    // Format: "Sun, 06 Nov 1994 08:49:37 GMT" (exact 29 bytes)
+    let bytes = trimmed.as_bytes();
+    if bytes.len() != 29 || !trimmed.ends_with(" GMT") {
+        return None;
+    }
+    if bytes.get(3) != Some(&b',')
+        || bytes.get(4) != Some(&b' ')
+        || bytes.get(7) != Some(&b' ')
+        || bytes.get(11) != Some(&b' ')
+        || bytes.get(16) != Some(&b' ')
+        || bytes.get(19) != Some(&b':')
+        || bytes.get(22) != Some(&b':')
+    {
+        return None;
+    }
+    let weekday = trimmed.get(0..3)?;
+    if !matches!(
+        weekday,
+        "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun"
+    ) {
+        return None;
+    }
+    let day: u32 = trimmed.get(5..7)?.parse().ok()?;
+    let month: u32 = match trimmed.get(8..11)? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u32 = trimmed.get(12..16)?.parse().ok()?;
+    let hour: u32 = trimmed.get(17..19)?.parse().ok()?;
+    let minute: u32 = trimmed.get(20..22)?.parse().ok()?;
+    let second: u32 = trimmed.get(23..25)?.parse().ok()?;
+
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let max_day = days_in_month(year, month)?;
+    if day == 0 || day > max_day {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs_i64 = days
+        .checked_mul(SECS_PER_DAY)?
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
+    let secs = u64::try_from(secs_i64).ok()?;
+    secs.checked_mul(1_000)
+}
+
 const fn is_leap_year(year: u32) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
@@ -224,5 +287,19 @@ mod tests {
         ] {
             assert!(parse_rfc3339(bad).is_err(), "expected error for {bad:?}");
         }
+    }
+
+    #[test]
+    fn parses_imf_fixdate_http_dates() {
+        assert_eq!(
+            parse_http_date_ms("Thu, 01 Jan 2026 00:06:00 GMT"),
+            Some(1_767_225_960_000)
+        );
+        assert_eq!(
+            parse_http_date_ms("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(1_445_412_480_000)
+        );
+        assert_eq!(parse_http_date_ms("Wed, 30 Feb 2026 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date_ms("not a date"), None);
     }
 }

@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -15,8 +16,8 @@ use zeroize::Zeroizing;
 use crate::clock::{Clock, SystemClock};
 use crate::crypto::b64_encode;
 use crate::push::{
-    DEFAULT_PROVIDER_TIMEOUT_MS, InvalidTokenClass, PushError, PushOutcome, PushSender,
-    UpstreamErrorClass, classify_http_status,
+    DEFAULT_PROVIDER_TIMEOUT_MS, InvalidTokenClass, ProviderBackoff, PushError, PushOutcome,
+    PushSender, UpstreamErrorClass, classify_http_status, parse_retry_after_ms,
 };
 use crate::store::{ApnsEnv, BoxFuture, Registration};
 
@@ -116,6 +117,7 @@ impl ApnsConfig {
 struct CachedJwt {
     token: Zeroizing<String>,
     issued_at_secs: u64,
+    generation: u64,
 }
 
 #[derive(Serialize)]
@@ -149,6 +151,9 @@ pub struct ApnsSender {
     sandbox_url: String,
     clock: Arc<dyn Clock>,
     cached_jwt: Mutex<Option<CachedJwt>>,
+    next_jwt_gen: AtomicU64,
+    backoff: ProviderBackoff,
+    auth_healthy: AtomicBool,
 }
 
 impl fmt::Debug for ApnsSender {
@@ -218,30 +223,43 @@ impl ApnsSender {
             sandbox_url: config.sandbox_url.trim_end_matches('/').to_owned(),
             clock,
             cached_jwt: Mutex::new(None),
+            next_jwt_gen: AtomicU64::new(0),
+            backoff: ProviderBackoff::new(),
+            auth_healthy: AtomicBool::new(true),
         })
     }
 
-    /// Returns a cached or freshly signed ES256 provider JWT.
-    fn bearer_jwt(&self) -> Result<Zeroizing<String>, PushError> {
+    /// Returns a cached or freshly signed ES256 provider JWT together with its generation.
+    fn bearer_jwt(&self) -> Result<(Zeroizing<String>, u64), PushError> {
         let now_secs = self.clock.now_ms() / 1_000;
         let mut guard = self.cached_jwt.lock();
         if let Some(cached) = guard.as_ref()
             && now_secs >= cached.issued_at_secs
             && now_secs - cached.issued_at_secs < APNS_JWT_TTL_SECS
         {
-            return Ok(cached.token.clone());
+            return Ok((cached.token.clone(), cached.generation));
         }
 
         let token = self.sign_jwt(now_secs)?;
+        let generation = self.next_jwt_gen.fetch_add(1, Ordering::Relaxed) + 1;
         *guard = Some(CachedJwt {
             token: token.clone(),
             issued_at_secs: now_secs,
+            generation,
         });
-        Ok(token)
+        Ok((token, generation))
     }
 
-    fn invalidate_jwt(&self) {
-        *self.cached_jwt.lock() = None;
+    /// Invalidates the cached JWT only if it still matches `failed_generation`, preventing
+    /// a stale concurrent auth error from evicting a freshly refreshed JWT.
+    fn invalidate_jwt_if_generation(&self, failed_generation: u64) {
+        let mut guard = self.cached_jwt.lock();
+        if guard
+            .as_ref()
+            .is_some_and(|cached| cached.generation == failed_generation)
+        {
+            *guard = None;
+        }
     }
 
     fn sign_jwt(&self, iat_secs: u64) -> Result<Zeroizing<String>, PushError> {
@@ -289,13 +307,20 @@ impl ApnsSender {
     }
 
     async fn send_once(&self, registration: &Registration) -> Result<ApnsResponse, PushError> {
+        if self.backoff.is_backing_off(self.clock.monotonic_ms()) {
+            return Err(PushError::Upstream {
+                class: UpstreamErrorClass::Backoff,
+                status: None,
+            });
+        }
+
         let env = registration.apns_env.unwrap_or(self.default_env);
         let base_url = match env {
             ApnsEnv::Production => &self.production_url,
             ApnsEnv::Sandbox => &self.sandbox_url,
         };
         let url = format!("{base_url}/3/device/{}", registration.device_token);
-        let jwt = self.bearer_jwt()?;
+        let (jwt, generation) = self.bearer_jwt()?;
         let auth_header = Zeroizing::new(format!("bearer {}", jwt.as_str()));
         let (push_type, priority, body) = self.wake_payload();
 
@@ -322,10 +347,17 @@ impl ApnsSender {
 
         let status = response.status();
         if status.is_success() {
+            self.auth_healthy.store(true, Ordering::Relaxed);
             return Ok(ApnsResponse::Outcome(PushOutcome::Delivered));
         }
 
         let status_code = status.as_u16();
+        if matches!(status_code, 429 | 503)
+            && let Some(delay_ms) = parse_retry_after_ms(response.headers(), self.clock.now_ms())
+        {
+            self.backoff.record(self.clock.monotonic_ms(), delay_ms);
+        }
+
         let reason = response
             .bytes()
             .await
@@ -334,7 +366,16 @@ impl ApnsSender {
             .and_then(|body| body.reason);
 
         if status_code == 403 && reason.as_deref() == Some("ExpiredProviderToken") {
-            return Ok(ApnsResponse::ExpiredToken);
+            return Ok(ApnsResponse::ExpiredToken { generation });
+        }
+
+        if status_code == 403
+            && matches!(
+                reason.as_deref(),
+                Some("InvalidProviderToken" | "MissingProviderToken")
+            )
+        {
+            self.auth_healthy.store(false, Ordering::Relaxed);
         }
 
         if let Some(class) = classify_invalid_apns_token(status_code, reason.as_deref()) {
@@ -350,7 +391,7 @@ impl ApnsSender {
 
 enum ApnsResponse {
     Outcome(PushOutcome),
-    ExpiredToken,
+    ExpiredToken { generation: u64 },
 }
 
 /// Parses a PKCS#8 (`PRIVATE KEY`) PEM P-256 private key (Apple `.p8` format) into a
@@ -458,17 +499,29 @@ impl PushSender for ApnsSender {
         Box::pin(async move {
             match self.send_once(registration).await? {
                 ApnsResponse::Outcome(outcome) => Ok(outcome),
-                ApnsResponse::ExpiredToken => {
-                    self.invalidate_jwt();
+                ApnsResponse::ExpiredToken { generation } => {
+                    self.invalidate_jwt_if_generation(generation);
                     match self.send_once(registration).await? {
                         ApnsResponse::Outcome(outcome) => Ok(outcome),
-                        ApnsResponse::ExpiredToken => Err(PushError::Auth {
-                            class: UpstreamErrorClass::Auth,
-                        }),
+                        ApnsResponse::ExpiredToken { .. } => {
+                            self.auth_healthy.store(false, Ordering::Relaxed);
+                            Err(PushError::Auth {
+                                class: UpstreamErrorClass::Auth,
+                            })
+                        }
                     }
                 }
             }
         })
+    }
+
+    fn check_ready(&self) -> Result<(), PushError> {
+        if !self.auth_healthy.load(Ordering::Relaxed) {
+            return Err(PushError::Auth {
+                class: UpstreamErrorClass::Auth,
+            });
+        }
+        self.bearer_jwt().map(|_| ())
     }
 }
 
