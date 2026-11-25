@@ -326,16 +326,19 @@ mod tests {
     }
 
     #[test]
-    fn verifies_official_switch_webhook_vector_byte_for_byte() {
-        const SWITCH_LABEL: &str = "pubky-switch/v1/push";
+    fn verifies_official_dispatch_webhook_vector_byte_for_byte() {
         const RELAY_URL: &str = "https://push.example/v1/hook";
-        const BODY: &[u8] = br#"{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}"#;
-        const SIG_B64: &str = "yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ";
-        const KEY_B64: &str = "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI";
-        const SECRET_HEX: &str = "3b8b79d112af033681ded4b8aea328b91f8ddb49928a8870e9501c77fe275279";
+        const BODY: &[u8] = br#"{"v":1,"handle":"dH9r2POzhkcCmW_2TUIRFQ","ts":"2026-01-01T00:06:00.000Z","nonce":"dgOrMASIWFmulwUPwzWlpQ"}"#;
+        const SIG_B64: &str = "1v9TMYsaXAjcvHnXWQYYOkVazExu5r1f6Vvj_mx0GKpjz0tV5eq_VGPzzgrBhqxdaOVC5P-4ZGAq2Y0D4fHuAg";
+        const KEY_B64: &str = "A_K47RLrjHBBJq2U9QpYGAjLCAIXJMic1XscmVFqPBc";
+        const SECRET_HEX: &str = "f4405752785ae5e245e1c62394e86c8349e0e7612e67b7cb100f93de800a02fe";
+        const SIGNED_BYTES_HEX: &str = "000000167075626b792d64697370617463682f76312f707573680000001468747470733a2f2f707573682e6578616d706c650000006a7b2276223a312c2268616e646c65223a226448397232504f7a686b63436d575f32545549524651222c227473223a22323032362d30312d30315430303a30363a30302e3030305a222c226e6f6e6365223a2264674f724d41534957466d756c775550777a576c7051227d";
 
         let origin = relay_origin(RELAY_URL).unwrap();
         assert_eq!(origin, "https://push.example");
+
+        let signed_bytes = lp(&[SIGNING_LABEL.as_bytes(), origin.as_bytes(), BODY]);
+        assert_eq!(hex::encode(&signed_bytes), SIGNED_BYTES_HEX);
 
         let public_key = b64_decode_array::<32>(KEY_B64).unwrap();
         let signature = b64_decode_array::<64>(SIG_B64).unwrap();
@@ -344,19 +347,25 @@ mod tests {
 
         assert_eq!(signing_key.verifying_key().to_bytes(), public_key);
 
-        let recomputed = sign_webhook(&signing_key, SWITCH_LABEL, &origin, BODY);
+        let recomputed = sign_webhook(&signing_key, SIGNING_LABEL, &origin, BODY);
         assert_eq!(b64_encode(&recomputed), SIG_B64);
 
-        verify_webhook_signature(&public_key, SWITCH_LABEL, &origin, BODY, &signature).unwrap();
+        verify_webhook_signature(&public_key, SIGNING_LABEL, &origin, BODY, &signature).unwrap();
 
         assert!(
-            verify_webhook_signature(&public_key, SIGNING_LABEL, &origin, BODY, &signature)
-                .is_err()
+            verify_webhook_signature(
+                &public_key,
+                "pubky-dispatch/v2/push",
+                &origin,
+                BODY,
+                &signature
+            )
+            .is_err()
         );
         assert!(
             verify_webhook_signature(
                 &public_key,
-                SWITCH_LABEL,
+                SIGNING_LABEL,
                 "https://elsewhere.example",
                 BODY,
                 &signature
