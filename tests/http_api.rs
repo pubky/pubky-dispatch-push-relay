@@ -20,7 +20,7 @@ use tower::ServiceExt as _;
 
 use pubky_dispatch_push_relay::client_ip::TrustedProxies;
 use pubky_dispatch_push_relay::clock::{Clock as _, FixedClock};
-use pubky_dispatch_push_relay::config::{ProtocolConfig, RelaySettings};
+use pubky_dispatch_push_relay::config::RelaySettings;
 use pubky_dispatch_push_relay::crypto::{
     SIGNATURE_HEADER, SIGNING_LABEL, b64_decode_array, b64_encode, relay_origin, sign_webhook,
 };
@@ -528,7 +528,7 @@ async fn hook_enforces_all_six_wire_format_8_3_rules_and_ordering() {
                 SIGNATURE_HEADER,
                 b64_encode(&sign_webhook(
                     &key,
-                    "pubky-switch/v1/push",
+                    "pubky-dispatch/v2/push",
                     TEST_ORIGIN,
                     valid_raw.as_bytes(),
                 )),
@@ -1131,21 +1131,20 @@ async fn handle_to_key_binding_isolation() {
 }
 
 #[tokio::test]
-async fn verifies_official_switch_webhook_vector_end_to_end() {
-    const VECTOR_BODY: &str = r#"{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}"#;
+async fn verifies_official_dispatch_webhook_vector_end_to_end() {
+    const VECTOR_BODY: &str = r#"{"v":1,"handle":"dH9r2POzhkcCmW_2TUIRFQ","ts":"2026-01-01T00:06:00.000Z","nonce":"dgOrMASIWFmulwUPwzWlpQ"}"#;
     const VECTOR_SIG: &str =
-        "yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ";
-    const VECTOR_KEY: &str = "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI";
+        "1v9TMYsaXAjcvHnXWQYYOkVazExu5r1f6Vvj_mx0GKpjz0tV5eq_VGPzzgrBhqxdaOVC5P-4ZGAq2Y0D4fHuAg";
+    const VECTOR_KEY: &str = "A_K47RLrjHBBJq2U9QpYGAjLCAIXJMic1XscmVFqPBc";
     const VECTOR_ORIGIN: &str = "https://push.example";
 
-    let mut settings = RelaySettings::new(VECTOR_ORIGIN).unwrap();
-    settings.protocol = ProtocolConfig::custom("Switch-Signature", "pubky-switch/v1/push");
+    let settings = RelaySettings::new(VECTOR_ORIGIN).unwrap();
     let app = TestApp::new(settings).await;
 
     app.store
         .insert(
             &Registration {
-                handle: "iUsOsTv5mB7OMLMdQZi8QA".to_owned(),
+                handle: "dH9r2POzhkcCmW_2TUIRFQ".to_owned(),
                 platform: Platform::Apns,
                 device_token: apns_token('f'),
                 push_key: b64_decode_array::<32>(VECTOR_KEY).unwrap(),
@@ -1164,7 +1163,7 @@ async fn verifies_official_switch_webhook_vector_end_to_end() {
                 .method("POST")
                 .uri("/v1/hook")
                 .header("content-type", "application/json")
-                .header("Switch-Signature", VECTOR_SIG)
+                .header(SIGNATURE_HEADER, VECTOR_SIG)
                 .body(Body::from(VECTOR_BODY))
                 .unwrap(),
         )
@@ -1178,7 +1177,7 @@ async fn verifies_official_switch_webhook_vector_end_to_end() {
                 .method("POST")
                 .uri("/v1/hook")
                 .header("content-type", "application/json")
-                .header("Switch-Signature", VECTOR_SIG)
+                .header(SIGNATURE_HEADER, VECTOR_SIG)
                 .body(Body::from(VECTOR_BODY))
                 .unwrap(),
         )

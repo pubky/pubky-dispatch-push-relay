@@ -46,7 +46,7 @@ Content-Type: application/json
 {
   "platform": "apns",
   "device_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "push_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+  "push_key": "A_K47RLrjHBBJq2U9QpYGAjLCAIXJMic1XscmVFqPBc",
   "apns_env": "production"
 }
 ```
@@ -64,7 +64,7 @@ Unknown fields are rejected (`400`).
 
 ```json
 {
-  "handle": "iUsOsTv5mB7OMLMdQZi8QA"
+  "handle": "dH9r2POzhkcCmW_2TUIRFQ"
 }
 ```
 
@@ -103,7 +103,7 @@ POST /v1/hook HTTP/1.1
 Content-Type: application/json
 Dispatch-Signature: <b64(64)>
 
-{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}
+{"v":1,"handle":"dH9r2POzhkcCmW_2TUIRFQ","ts":"2026-01-01T00:06:00.000Z","nonce":"dgOrMASIWFmulwUPwzWlpQ"}
 ```
 
 **Signature Input**
